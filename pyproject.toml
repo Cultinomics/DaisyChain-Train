@@ -22,8 +22,8 @@ daisychain-agent = "daisychain.dashboard.agent:main"
 daisychain-dashboard = "daisychain.dashboard.server:main"
 
 [project.urls]
-Homepage = "https://github.com/quzi93/old-hw-train"
-HuggingFace = "https://huggingface.co/DaisyChainAI/old-hw-train"
+Homepage = "https://github.com/quzi93/DaisyChain-Train"
+HuggingFace = "https://huggingface.co/DaisyChainAI/DaisyChain-Train"
 
 [tool.setuptools]
 packages = ["daisychain", "daisychain.dashboard", "daisychain.verified"]
