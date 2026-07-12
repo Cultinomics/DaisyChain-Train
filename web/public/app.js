@@ -2,8 +2,8 @@
 // train a shared model together — averaging gradients over the data channels.
 "use strict";
 
-const DIN = 16, H = 16, DOUT = 4, NPER = 128, LR = 0.03, DEFAULT_STEPS = 300;
-const D = { n: NPER, din: DIN, h: H, dout: DOUT };
+const DIN = 16, DOUT = 4, NPER = 128;
+let D = { n: NPER, din: DIN, h: 16, dout: DOUT };   // h is set by the training-settings slider
 const STUN = [{ urls: "stun:stun.l.google.com:19302" }];
 
 const ui = {
@@ -21,6 +21,12 @@ const ui = {
   load: document.getElementById("load"),
   loadBtn: document.getElementById("loadBtn"),
   requests: document.getElementById("requests"),
+  roomInfo: document.getElementById("roomInfo"),
+  roomCode: document.getElementById("roomCode"),
+  copyLink: document.getElementById("copyLink"),
+  cfgH: document.getElementById("cfgH"),
+  cfgSteps: document.getElementById("cfgSteps"),
+  cfgLr: document.getElementById("cfgLr"),
 };
 function log(m) { ui.log.textContent = `${new Date().toLocaleTimeString()}  ${m}\n` + ui.log.textContent; }
 function setStatus(s) { ui.status.textContent = s; }
@@ -156,7 +162,7 @@ const CKPT_SENTINEL = -2;                      // wire: [int32 -2][checkpoint by
 function packCheckpoint() {
   const buf = new ArrayBuffer(8 + 16 + (W1.length + W2.length) * 4);
   new Uint8Array(buf, 0, 8).set([...CKPT_MAGIC].map(c => c.charCodeAt(0)));
-  new Int32Array(buf, 8, 4).set([DIN, H, DOUT, trainedSteps]);
+  new Int32Array(buf, 8, 4).set([DIN, D.h, DOUT, trainedSteps]);
   new Float32Array(buf, 24, W1.length).set(W1);
   new Float32Array(buf, 24 + W1.length * 4, W2.length).set(W2);
   return buf;
@@ -165,13 +171,14 @@ function parseCheckpoint(buf) {
   const magic = String.fromCharCode(...new Uint8Array(buf, 0, 8));
   if (magic !== CKPT_MAGIC) throw new Error("not a DaisyChain checkpoint");
   const [din, h, dout, steps] = new Int32Array(buf, 8, 4);
-  if (din !== DIN || h !== H || dout !== DOUT)
-    throw new Error(`shape mismatch: file is ${din}×${h}×${dout}, this build is ${DIN}×${H}×${DOUT}`);
+  if (din !== DIN || dout !== DOUT || h < 8 || h > 64)
+    throw new Error(`shape mismatch: file is ${din}×${h}×${dout}, this build is ${DIN}×(8–64)×${DOUT}`);
   if (buf.byteLength !== 24 + (din * h + h * dout) * 4) throw new Error("truncated checkpoint");
-  return { steps, w1: new Float32Array(buf.slice(24, 24 + din * h * 4)),
+  return { h, steps, w1: new Float32Array(buf.slice(24, 24 + din * h * 4)),
            w2: new Float32Array(buf.slice(24 + din * h * 4)) };
 }
 function applyCheckpoint(ck, from) {
+  if (ck.h !== D.h) { buildModel(ck.h); showCfgInUI({ h: ck.h, steps: +ui.cfgSteps.value, lr: +ui.cfgLr.value / 100 }); }
   W1.set(ck.w1); W2.set(ck.w2); trainedSteps = ck.steps;
   ui.save.disabled = false;
   ui.step.textContent = `${ck.steps} baked in`;
@@ -190,9 +197,39 @@ function saveCheckpoint() {
   const blob = new Blob([packCheckpoint()], { type: "application/octet-stream" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
-  a.download = `daisychain-${DIN}x${H}x${DOUT}-step${trainedSteps}.pt`;
+  a.download = `daisychain-${DIN}x${D.h}x${DOUT}-step${trainedSteps}.pt`;
   a.click();
   URL.revokeObjectURL(a.href);
+}
+
+// ---- training config: whoever presses Start sets it for the whole group ----
+const CFG_SENTINEL = -3;                       // wire: [int32 -3][int32 h,steps][f32 lr]
+function readCfgFromUI() {
+  return { h: +ui.cfgH.value, steps: +ui.cfgSteps.value, lr: +ui.cfgLr.value / 100 };
+}
+function showCfgInUI(cfg) {
+  ui.cfgH.value = cfg.h; document.getElementById("vcfgH").textContent = cfg.h;
+  ui.cfgSteps.value = cfg.steps; document.getElementById("vcfgSteps").textContent = cfg.steps;
+  ui.cfgLr.value = Math.round(cfg.lr * 100); document.getElementById("vcfgLr").textContent = Math.round(cfg.lr * 100);
+}
+function broadcastConfig(cfg) {
+  const buf = new ArrayBuffer(16);
+  new Int32Array(buf, 0, 3).set([CFG_SENTINEL, cfg.h, cfg.steps]);
+  new Float32Array(buf, 12, 1)[0] = cfg.lr;
+  for (const dc of chans.values()) if (dc.readyState === "open") dc.send(buf);
+}
+function onConfig(peerId, buf) {
+  if (training) { log(`ignored settings from ${nmeOf(peerId)} (already training)`); return; }
+  const [, h, steps] = new Int32Array(buf, 0, 3);
+  const lr = new Float32Array(buf, 12, 1)[0];
+  if (!(h >= 8 && h <= 64 && steps >= 1 && steps <= 10000 && lr > 0 && lr <= 1)) {
+    log(`rejected bad settings from ${nmeOf(peerId)}`); return;
+  }
+  const cfg = { h, steps, lr };
+  showCfgInUI(cfg);
+  log(`${nmeOf(peerId)} started the group: hidden=${h}, ${steps} steps, lr=${lr}`);
+  buildModel(cfg.h);
+  train(cfg);                                  // follow automatically
 }
 
 // ---- gradient wire format:  [int32 step][float32 grad...] -----------------
@@ -206,6 +243,7 @@ const waiters = new Set();                       // pending waitForGrads checker
 function wake() { for (const w of waiters) w(); }
 function onGrad(peerId, buf) {
   const step = new Int32Array(buf, 0, 1)[0];
+  if (step === CFG_SENTINEL) { onConfig(peerId, buf); return; }
   if (step === CKPT_SENTINEL) {                  // a peer pushed a checkpoint
     if (training) { log(`ignored checkpoint from ${nmeOf(peerId)} (training in progress)`); return; }
     try { applyCheckpoint(parseCheckpoint(buf.slice(4)), nmeOf(peerId)); }
@@ -250,12 +288,13 @@ async function localStep() {
 }
 
 // ---- the training loop -----------------------------------------------------
-async function train() {
+async function train(cfg) {
   if (training) return; training = true; ui.start.disabled = true;
+  [ui.cfgH, ui.cfgSteps, ui.cfgLr].forEach(el => el.disabled = true);
   const cohort = [...chans.keys()];                    // lock the cohort (departed peers are pruned per-step)
-  const steps = DEFAULT_STEPS;
-  const opt = TrainCore.makeAdam(W1.length + W2.length, { lr: 0.2 });   // swept: best on the verified-unit STE grads
-  log(`training started — cohort ${cohort.length} peer(s), world ${cohort.length + 1}, optimizer ${opt.name}`);
+  const steps = cfg.steps;
+  const opt = TrainCore.makeAdam(W1.length + W2.length, { lr: cfg.lr });
+  log(`training started — cohort ${cohort.length} peer(s), world ${cohort.length + 1}, hidden=${cfg.h}, optimizer ${opt.name}`);
   for (let s = 0; s < steps; s++) {
     const { loss, grad } = await localStep();
     broadcastGrad(s, grad);
@@ -278,18 +317,55 @@ async function train() {
   training = false;
   ui.save.disabled = false;
   ui.start.disabled = false;
+  [ui.cfgH, ui.cfgSteps, ui.cfgLr].forEach(el => el.disabled = false);
 }
 
 // 2-layer float target (matches the model shape) for a learnable task
-function target(X) {
-  const Wt1 = randn(DIN * H, mulberry32(42)), Wt2 = randn(H * DOUT, mulberry32(43));
-  const hpre = TrainCore.matmul(X, Wt1, NPER, DIN, H);
+function target(X, h) {
+  const Wt1 = randn(DIN * h, mulberry32(42)), Wt2 = randn(h * DOUT, mulberry32(43));
+  const hpre = TrainCore.matmul(X, Wt1, NPER, DIN, h);
   for (let i = 0; i < hpre.length; i++) hpre[i] = Math.max(0, hpre[i]);
-  return TrainCore.matmul(hpre, Wt2, NPER, H, DOUT);
+  return TrainCore.matmul(hpre, Wt2, NPER, h, DOUT);
+}
+
+// (re)build the model for a hidden size — deterministic shared init (same seeds
+// on every peer), fresh per-peer data shard
+function buildModel(h) {
+  D = { n: NPER, din: DIN, h, dout: DOUT };
+  W1 = randn(DIN * h, mulberry32(7));
+  W2 = randn(h * DOUT, mulberry32(8));
+  Xdata = randn(NPER * DIN);
+  Ydata = target(Xdata, h);
+  trainedSteps = 0;
 }
 
 // ---- boot ------------------------------------------------------------------
 (async function () {
+  // Room-first deployments (the HF Space sets DAISY_FORCE_ROOMS): there is no
+  // LAN auto-grouping between strangers — visitors without a room code choose
+  // to create their own room (they become its host) or join one by code.
+  try {
+    const mode = await (await fetch("mode")).json();
+    if (mode.forceRooms && !room()) {
+      const lobby = document.getElementById("lobby");
+      for (const c of document.querySelectorAll(".card")) if (c !== lobby) c.style.display = "none";
+      lobby.style.display = "";
+      document.getElementById("createRoom").onclick = () => {
+        const code = (ADJ[Math.floor(Math.random() * ADJ.length)] + "-" +
+                      NOUN[Math.floor(Math.random() * NOUN.length)] + "-" +
+                      (100 + Math.floor(Math.random() * 900))).toLowerCase();
+        location.href = "?room=" + code;
+      };
+      const join = () => {
+        const code = document.getElementById("joinCode").value.trim().toLowerCase();
+        if (code) location.href = "?room=" + encodeURIComponent(code);
+      };
+      document.getElementById("joinRoom").onclick = join;
+      document.getElementById("joinCode").onkeydown = (e) => { if (e.key === "Enter") join(); };
+      return;                                            // wait for the choice
+    }
+  } catch (e) {}                                         // no /mode: local default
+
   // Neural Units are mandatory: no LUTs -> no training, period. There is no
   // float fallback path anywhere in this app; both backends (WebGPU shader and
   // CPU JS) compute every product through the verified mul8 LUT.
@@ -310,15 +386,28 @@ function target(X) {
     return;                                              // no signaling, no training
   }
   ui.backend.textContent = `${compute.backend.toUpperCase()} — ${compute.label} · through verified INT8 units`;
-  // deterministic shared init (no weight broadcast); per-peer random data shard
-  W1 = randn(DIN * H, mulberry32(7));
-  W2 = randn(H * DOUT, mulberry32(8));
-  Xdata = randn(NPER * DIN);
-  Ydata = target(Xdata);
+  // slider readouts
+  for (const [el, v] of [[ui.cfgH, "vcfgH"], [ui.cfgSteps, "vcfgSteps"], [ui.cfgLr, "vcfgLr"]])
+    el.oninput = () => document.getElementById(v).textContent = el.value;
+  buildModel(+ui.cfgH.value);
   ui.me.textContent = deviceName;
+  if (room()) {
+    ui.roomInfo.style.display = "";
+    ui.roomCode.textContent = room();
+    ui.copyLink.onclick = async () => {
+      try { await navigator.clipboard.writeText(location.href); ui.copyLink.textContent = "Copied!"; }
+      catch { ui.copyLink.textContent = location.href; }
+      setTimeout(() => ui.copyLink.textContent = "Copy invite link", 2000);
+    };
+  }
   updatePeers();
   connectSignaling();
-  ui.start.onclick = train;
+  ui.start.onclick = () => {
+    const cfg = readCfgFromUI();
+    buildModel(cfg.h);
+    broadcastConfig(cfg);                                // everyone follows these settings
+    train(cfg);
+  };
   ui.save.onclick = saveCheckpoint;
   ui.loadBtn.onclick = () => { if (training) { log("can't load a checkpoint mid-training"); return; } ui.load.click(); };
   ui.load.onchange = async () => {

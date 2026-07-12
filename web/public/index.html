@@ -62,6 +62,9 @@
         font-family: 'Courier New', monospace; }
   @media (prefers-color-scheme: dark) { pre { background: rgba(0,0,0,0.25); } }
   .note { color: var(--text-soft); font-size: .82rem; }
+  .slbl { display: flex; justify-content: space-between; font-size: .92rem; margin: 10px 0 4px; font-weight: 600; }
+  .sval { font-family: 'Courier New', monospace; color: var(--accent); font-weight: 700; }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
   .note b { color: var(--warn); }
   .diff { color: var(--accent-deep); font-weight: 600; font-size: .88rem; }
   @media (prefers-color-scheme: dark) { .diff { color: var(--accent); } }
@@ -70,6 +73,17 @@
 <body>
   <h1>🌼 DaisyChain-Web</h1>
   <p class="sub">Open this on your other devices <b>on the same network</b> and they train a shared model together — peer-to-peer, right in the browser, through the emulated GPU logic. Only devices on your network are grouped (like Snapdrop). To invite people across networks, everyone opens <code>?room=YOUR-CODE</code> — the person who created the room approves each device before it can join.</p>
+
+  <div class="card" id="lobby" style="display:none;text-align:center">
+    <div class="lbl">🏡 Get started</div>
+    <p class="note" style="margin:0 0 12px">Create a room and invite your devices, or join a room someone shared with you.</p>
+    <button id="createRoom">Create a room</button>
+    <div style="display:flex;gap:8px;justify-content:center;margin-top:12px;flex-wrap:wrap">
+      <input type="text" id="joinCode" placeholder="room code" spellcheck="false"
+             style="padding:10px 12px;border-radius:8px;border:1px solid var(--card-border);background:transparent;color:inherit;font-family:'Courier New',monospace">
+      <button id="joinRoom" style="padding:10px 18px">Join</button>
+    </div>
+  </div>
 
   <div class="card">
     <div class="lbl">🌲 This device</div>
@@ -81,7 +95,23 @@
   <div class="card">
     <div class="lbl">🍄 Devices in your group</div>
     <div class="row"><span class="v" id="peers" style="text-align:left">(none yet)</span></div>
+    <div id="roomInfo" style="display:none;margin-top:8px">
+      <div class="row"><span class="k">Room</span><span class="v" id="roomCode"></span></div>
+      <div style="text-align:center;margin-top:6px"><button id="copyLink" style="padding:6px 14px;font-size:.85rem">Copy invite link</button></div>
+      <p class="note" style="margin:.5rem 0 0;text-align:center">Open the link on your other devices — you approve each one before it joins.</p>
+    </div>
     <div id="requests"></div>
+  </div>
+
+  <div class="card">
+    <div class="lbl">🎛 Training settings</div>
+    <label class="slbl">Hidden units <span class="sval" id="vcfgH">16</span></label>
+    <input type="range" id="cfgH" min="8" max="64" step="8" value="16">
+    <label class="slbl">Steps <span class="sval" id="vcfgSteps">300</span></label>
+    <input type="range" id="cfgSteps" min="100" max="1000" step="100" value="300">
+    <label class="slbl">Learning rate ×100 <span class="sval" id="vcfgLr">20</span></label>
+    <input type="range" id="cfgLr" min="5" max="50" step="5" value="20">
+    <p class="note" style="margin:.5rem 0 0">Whoever presses Start sets the settings for the whole group — every device follows automatically.</p>
   </div>
 
   <div class="card" style="text-align:center">

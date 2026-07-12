@@ -32,6 +32,12 @@ const TYPES = { ".html": "text/html", ".js": "text/javascript",
 
 const server = http.createServer((req, res) => {
   let p = decodeURIComponent(req.url.split("?")[0]);
+  if (p === "/mode") {                 // deployment flags for the client
+    res.writeHead(200, { "Content-Type": "application/json" });
+    // DAISY_FORCE_ROOMS=1 (set on the HF Space): no LAN auto-grouping — every
+    // visitor creates their own private room and invites devices by link
+    return res.end(JSON.stringify({ forceRooms: !!process.env.DAISY_FORCE_ROOMS }));
+  }
   if (p === "/") p = "/index.html";
   const file = path.join(PUB, path.normalize(p));
   if (!file.startsWith(PUB)) { res.writeHead(403); return res.end(); }
