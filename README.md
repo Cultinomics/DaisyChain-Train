@@ -1,3 +1,13 @@
+---
+license: mit
+tags:
+  - distributed-training
+  - old-hardware
+  - cluster
+  - verified-units
+  - pytorch
+---
+
 # 🌼 DaisyChain — Old Hardware Training Pipeline
 
 > **In plain terms:** DaisyChain lets you use **old / spare machines** to train
