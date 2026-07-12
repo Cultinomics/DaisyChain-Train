@@ -26,6 +26,8 @@ Two ways to run — **Docker** or **Python**.
 > Built by **DaisyChainAI**. Point it at your model + data and it trains across
 > whatever old machines you have, through the emulated GPU logic.
 
+**Repositories:** [GitHub](https://github.com/quzi93/old-hw-train) · [🤗 HuggingFace](https://huggingface.co/DaisyChainAI/old-hw-train)
+
 ---
 
 ## ⚠️ Read this first
