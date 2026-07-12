@@ -91,7 +91,7 @@ Adam optimizer (identical state on every peer, nothing extra over the wire),
 checkpoint **download** (.pt) and **upload → broadcast** so one device can
 restore the whole group after a failure.
 
-**Live demo:** https://huggingface.co/spaces/DaisyChainAI/DaisyChain-Web
+**Live demo:** https://huggingface.co/spaces/Quazim0t0/DaisyChain-Web
 
 ---
 
