@@ -1,0 +1,45 @@
+# DaisyChain demo cluster: 3 node containers + a dashboard on one Docker network.
+# In production each node is a real machine (see docs/TAILSCALE.md); this brings
+# the whole thing up on one box so you can see it work.
+#
+#   docker compose -f docker/docker-compose.yml up --build
+#   open http://localhost:8080
+name: daisychain
+x-node: &node
+  build: { context: .., dockerfile: docker/Dockerfile }
+  image: daisychain:latest
+  environment: &env
+    MASTER_ADDR: rank0
+    MASTER_PORT: "29560"
+    WORLD_SIZE: "3"
+    DAISY_STEPS: "300"
+    DAISY_STEP_SLEEP: "0.1"      # demo pacing so the dashboard shows it live
+    # train through the emulated GPU logic (verified INT8 units) by default
+    DAISY_TASK: "daisychain.verified_task:VerifiedTask"
+  networks: [cluster]
+
+services:
+  rank0:
+    <<: *node
+    environment: { <<: *env, RANK: "0", DAISY_CAPACITY: "8000" }
+  rank1:
+    <<: *node
+    depends_on: [rank0]
+    environment: { <<: *env, RANK: "1", DAISY_CAPACITY: "4000" }
+  rank2:
+    <<: *node
+    depends_on: [rank0]
+    environment: { <<: *env, RANK: "2", DAISY_CAPACITY: "2000" }
+  dashboard:
+    build: { context: .., dockerfile: docker/dashboard.Dockerfile }
+    image: daisychain-dashboard:latest
+    depends_on: [rank0, rank1, rank2]
+    environment:
+      DAISY_NODES_FILE: config/nodes.example.json
+      DAISY_EXPECTED_WORLD: "3"
+      DAISY_BASE_BATCH: "32"
+    ports: ["8080:8080"]
+    networks: [cluster]
+
+networks:
+  cluster: { driver: bridge }

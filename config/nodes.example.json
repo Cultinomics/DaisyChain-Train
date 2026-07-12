@@ -1,0 +1,5 @@
+[
+  { "name": "rank0 (coordinator)", "host": "rank0", "agent_port": 8900, "gloo_port": 29560 },
+  { "name": "rank1",               "host": "rank1", "agent_port": 8900, "gloo_port": 29560 },
+  { "name": "rank2",               "host": "rank2", "agent_port": 8900, "gloo_port": 29560 }
+]

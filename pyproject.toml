@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "daisychain"
+version = "0.1.0"
+description = "DaisyChain — Old Hardware Training Pipeline: chain spare machines into a data-parallel training cluster."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Dean Byrne (Quazim0t0)" }]
+keywords = ["distributed-training", "old-hardware", "cluster", "cpu", "gpu", "data-parallel"]
+dependencies = ["torch>=2.0", "numpy>=1.23"]
+
+[project.optional-dependencies]
+dashboard = ["psutil>=5.9"]
+
+[project.scripts]
+daisychain-train = "daisychain.train:main"
+daisychain-agent = "daisychain.dashboard.agent:main"
+daisychain-dashboard = "daisychain.dashboard.server:main"
+
+[project.urls]
+Homepage = "https://github.com/quzi93/daisychain"
+HuggingFace = "https://huggingface.co/DaisyChainAI/old-hw-train"
+
+[tool.setuptools]
+packages = ["daisychain", "daisychain.dashboard", "daisychain.verified"]
+
+[tool.setuptools.package-data]
+"daisychain.verified" = ["weights/*.pt"]
