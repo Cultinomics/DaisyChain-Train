@@ -10,6 +10,10 @@ tags:
 
 # 🌼 DaisyChain — Old Hardware Training Pipeline
 
+> **Whats available is currently the template. The Main Core Update will be uploaded later on today 7/12**
+
+
+
 > **In plain terms:** DaisyChain lets you use **old / spare machines** to train
 > neural networks. The training runs through **emulated GPU logic** — verified
 > INT8 units (GUDA-style) that stand in for a GPU's math — so machines *without*
