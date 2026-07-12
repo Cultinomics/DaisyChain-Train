@@ -2,8 +2,8 @@
 // train a shared model together — averaging gradients over the data channels.
 "use strict";
 
-const DIN = 16, DOUT = 4, NPER = 128;
-let D = { n: NPER, din: DIN, h: 16, dout: DOUT };   // h is set by the training-settings slider
+// model + task now live in transformer.js — a mini transformer LM trained
+// through the verified INT8 units. Settings come from the sliders.
 const STUN = [{ urls: "stun:stun.l.google.com:19302" }];
 
 const ui = {
@@ -24,7 +24,9 @@ const ui = {
   roomInfo: document.getElementById("roomInfo"),
   roomCode: document.getElementById("roomCode"),
   copyLink: document.getElementById("copyLink"),
-  cfgH: document.getElementById("cfgH"),
+  cfgC: document.getElementById("cfgC"),
+  cfgT: document.getElementById("cfgT"),
+  cfgB: document.getElementById("cfgB"),
   cfgSteps: document.getElementById("cfgSteps"),
   cfgLr: document.getElementById("cfgLr"),
 };
@@ -48,7 +50,7 @@ let myId = null, compute = null, ws = null, L = null, wasDenied = false;
 const pcs = new Map(), chans = new Map();      // peerId -> RTCPeerConnection / DataChannel
 const names = new Map();                       // peerId -> device name
 const incoming = new Map();                    // step -> Map(peerId -> Float32Array)
-let W1, W2, Xdata, Ydata, training = false;    // 2-layer verified model
+let model = null, training = false;            // the mini transformer (transformer.js)
 let trainedSteps = 0;                          // steps baked into the current weights
 function nmeOf(id) { return names.get(id) || id; }
 
@@ -154,32 +156,35 @@ function cleanupPeer(id) { const pc = pcs.get(id); if (pc) pc.close(); pcs.delet
 
 // ---- checkpoints ------------------------------------------------------------
 // File layout (also the broadcast payload after the sentinel):
-//   8 bytes magic "DAISYPT1" | int32 din,h,dout,steps | f32 W1 | f32 W2
+//   8 bytes magic "DAISYPT2" | int32 c,t,vocab,steps | f32 flat params
 // DaisyChain's own format (not torch-pickle) — .pt extension for familiarity.
-const CKPT_MAGIC = "DAISYPT1";
+const CKPT_MAGIC = "DAISYPT2";
 const CKPT_SENTINEL = -2;                      // wire: [int32 -2][checkpoint bytes]
 
 function packCheckpoint() {
-  const buf = new ArrayBuffer(8 + 16 + (W1.length + W2.length) * 4);
+  const flat = Transformer.getFlatParams(model);
+  const buf = new ArrayBuffer(8 + 16 + flat.length * 4);
   new Uint8Array(buf, 0, 8).set([...CKPT_MAGIC].map(c => c.charCodeAt(0)));
-  new Int32Array(buf, 8, 4).set([DIN, D.h, DOUT, trainedSteps]);
-  new Float32Array(buf, 24, W1.length).set(W1);
-  new Float32Array(buf, 24 + W1.length * 4, W2.length).set(W2);
+  new Int32Array(buf, 8, 4).set([model.cfg.c, model.cfg.t, model.cfg.vocab, trainedSteps]);
+  new Float32Array(buf, 24).set(flat);
   return buf;
 }
 function parseCheckpoint(buf) {
   const magic = String.fromCharCode(...new Uint8Array(buf, 0, 8));
-  if (magic !== CKPT_MAGIC) throw new Error("not a DaisyChain checkpoint");
-  const [din, h, dout, steps] = new Int32Array(buf, 8, 4);
-  if (din !== DIN || dout !== DOUT || h < 8 || h > 64)
-    throw new Error(`shape mismatch: file is ${din}×${h}×${dout}, this build is ${DIN}×(8–64)×${DOUT}`);
-  if (buf.byteLength !== 24 + (din * h + h * dout) * 4) throw new Error("truncated checkpoint");
-  return { h, steps, w1: new Float32Array(buf.slice(24, 24 + din * h * 4)),
-           w2: new Float32Array(buf.slice(24 + din * h * 4)) };
+  if (magic !== CKPT_MAGIC) throw new Error("not a DaisyChain v2 checkpoint");
+  const [c, t, vocab, steps] = new Int32Array(buf, 8, 4);
+  if (vocab !== Transformer.VOCAB) throw new Error(`vocab mismatch (file ${vocab}, this build ${Transformer.VOCAB})`);
+  if (c < 16 || c > 64 || t < 16 || t > 64) throw new Error(`bad dims in checkpoint (width ${c}, seq ${t})`);
+  return { c, t, steps, flat: new Float32Array(buf.slice(24)) };
 }
 function applyCheckpoint(ck, from) {
-  if (ck.h !== D.h) { buildModel(ck.h); showCfgInUI({ h: ck.h, steps: +ui.cfgSteps.value, lr: +ui.cfgLr.value / 100 }); }
-  W1.set(ck.w1); W2.set(ck.w2); trainedSteps = ck.steps;
+  if (!model || model.cfg.c !== ck.c || model.cfg.t !== ck.t) {
+    buildModel({ ...readCfgFromUI(), c: ck.c, t: ck.t });
+    showCfgInUI({ ...readCfgFromUI(), c: ck.c, t: ck.t });
+  }
+  if (ck.flat.length !== model.nParams) throw new Error("truncated checkpoint");
+  Transformer.setFlatParams(model, ck.flat);
+  trainedSteps = ck.steps;
   ui.save.disabled = false;
   ui.step.textContent = `${ck.steps} baked in`;
   log(`checkpoint loaded (${ck.steps} steps) ${from ? "from " + from : "from file"} — all set to resume`);
@@ -197,38 +202,41 @@ function saveCheckpoint() {
   const blob = new Blob([packCheckpoint()], { type: "application/octet-stream" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
-  a.download = `daisychain-${DIN}x${D.h}x${DOUT}-step${trainedSteps}.pt`;
+  a.download = `daisychain-lm-w${model.cfg.c}-step${trainedSteps}.pt`;
   a.click();
   URL.revokeObjectURL(a.href);
 }
 
 // ---- training config: whoever presses Start sets it for the whole group ----
-const CFG_SENTINEL = -3;                       // wire: [int32 -3][int32 h,steps][f32 lr]
+const CFG_SENTINEL = -3;                       // wire: [int32 -3][int32 c,t,b,steps][f32 lr]
 function readCfgFromUI() {
-  return { h: +ui.cfgH.value, steps: +ui.cfgSteps.value, lr: +ui.cfgLr.value / 100 };
+  return { c: +ui.cfgC.value, t: +ui.cfgT.value, b: +ui.cfgB.value,
+           steps: +ui.cfgSteps.value, lr: +ui.cfgLr.value / 1000 };
 }
 function showCfgInUI(cfg) {
-  ui.cfgH.value = cfg.h; document.getElementById("vcfgH").textContent = cfg.h;
-  ui.cfgSteps.value = cfg.steps; document.getElementById("vcfgSteps").textContent = cfg.steps;
-  ui.cfgLr.value = Math.round(cfg.lr * 100); document.getElementById("vcfgLr").textContent = Math.round(cfg.lr * 100);
+  const set = (el, vid, val) => { el.value = val; document.getElementById(vid).textContent = val; };
+  set(ui.cfgC, "vcfgC", cfg.c); set(ui.cfgT, "vcfgT", cfg.t); set(ui.cfgB, "vcfgB", cfg.b);
+  set(ui.cfgSteps, "vcfgSteps", cfg.steps);
+  set(ui.cfgLr, "vcfgLr", Math.round(cfg.lr * 1000));
 }
 function broadcastConfig(cfg) {
-  const buf = new ArrayBuffer(16);
-  new Int32Array(buf, 0, 3).set([CFG_SENTINEL, cfg.h, cfg.steps]);
-  new Float32Array(buf, 12, 1)[0] = cfg.lr;
+  const buf = new ArrayBuffer(24);
+  new Int32Array(buf, 0, 5).set([CFG_SENTINEL, cfg.c, cfg.t, cfg.b, cfg.steps]);
+  new Float32Array(buf, 20, 1)[0] = cfg.lr;
   for (const dc of chans.values()) if (dc.readyState === "open") dc.send(buf);
 }
 function onConfig(peerId, buf) {
   if (training) { log(`ignored settings from ${nmeOf(peerId)} (already training)`); return; }
-  const [, h, steps] = new Int32Array(buf, 0, 3);
-  const lr = new Float32Array(buf, 12, 1)[0];
-  if (!(h >= 8 && h <= 64 && steps >= 1 && steps <= 10000 && lr > 0 && lr <= 1)) {
+  const [, c, t, b, steps] = new Int32Array(buf, 0, 5);
+  const lr = new Float32Array(buf, 20, 1)[0];
+  if (!(c >= 16 && c <= 64 && c % 2 === 0 && t >= 16 && t <= 64 && b >= 1 && b <= 32 &&
+        steps >= 1 && steps <= 10000 && lr > 0 && lr <= 0.2)) {
     log(`rejected bad settings from ${nmeOf(peerId)}`); return;
   }
-  const cfg = { h, steps, lr };
+  const cfg = { c, t, b, steps, lr };
   showCfgInUI(cfg);
-  log(`${nmeOf(peerId)} started the group: hidden=${h}, ${steps} steps, lr=${lr}`);
-  buildModel(cfg.h);
+  log(`${nmeOf(peerId)} started the group: width=${c}, seq=${t}, batch=${b}, ${steps} steps, lr=${lr}`);
+  buildModel(cfg);
   train(cfg);                                  // follow automatically
 }
 
@@ -281,20 +289,19 @@ function waitForGrads(step, cohort, timeoutMs = 8000) {
 
 // ---- compute: one async training step THROUGH the verified units -----------
 async function localStep() {
-  // forward runs through the verified INT8 multiply (WebGPU or CPU); STE backward
-  const fwd = await Verified.forward(Xdata, Ydata, W1, W2, D, L, compute.matmulInt8);
-  const grad = Verified.backward(Xdata, W1, W2, fwd, D);          // flat [gW1, gW2]
-  return { loss: fwd.loss, grad };
+  // transformer forward runs through the verified INT8 multiply; STE backward
+  return Transformer.trainStep(model);
 }
 
 // ---- the training loop -----------------------------------------------------
 async function train(cfg) {
   if (training) return; training = true; ui.start.disabled = true;
-  [ui.cfgH, ui.cfgSteps, ui.cfgLr].forEach(el => el.disabled = true);
+  cfgSliders().forEach(el => el.disabled = true);
   const cohort = [...chans.keys()];                    // lock the cohort (departed peers are pruned per-step)
   const steps = cfg.steps;
-  const opt = TrainCore.makeAdam(W1.length + W2.length, { lr: cfg.lr });
-  log(`training started — cohort ${cohort.length} peer(s), world ${cohort.length + 1}, hidden=${cfg.h}, optimizer ${opt.name}`);
+  const opt = TrainCore.makeAdam(model.nParams, { lr: cfg.lr });
+  log(`training started — cohort ${cohort.length} peer(s), world ${cohort.length + 1}, ` +
+      `width=${cfg.c} seq=${cfg.t} batch=${cfg.b}×${cohort.length + 1}, optimizer ${opt.name}`);
   for (let s = 0; s < steps; s++) {
     const { loss, grad } = await localStep();
     broadcastGrad(s, grad);
@@ -302,7 +309,7 @@ async function train(cfg) {
     const all = [grad, ...remote];
     const avg = TrainCore.averageGrads(all);
     const upd = opt.step(avg);                      // DaisyAdam on the cluster-avg grad
-    Verified.splitApply(W1, W2, upd, 1);            // W -= 1 * upd (lr folded into upd)
+    Transformer.applyUpdate(model, upd);            // W -= upd (lr folded into upd)
     incoming.delete(s);
     trainedSteps++;
     if (s % 10 === 0 || s === steps - 1) {
@@ -312,30 +319,24 @@ async function train(cfg) {
       await new Promise(r => setTimeout(r, 0));         // yield to UI
     }
   }
-  ui.diff.textContent = `done — trained through the verified units; all peers share one model.`;
   log(`training done — final loss ${ui.loss.textContent}`);
+  try {
+    const sample = await Transformer.generate(model, "the ", 70);
+    ui.diff.textContent = `the model speaks: “${sample.trim()}”`;
+  } catch (e) {
+    ui.diff.textContent = "done — trained through the verified units; all peers share one model.";
+  }
   training = false;
   ui.save.disabled = false;
   ui.start.disabled = false;
-  [ui.cfgH, ui.cfgSteps, ui.cfgLr].forEach(el => el.disabled = false);
+  cfgSliders().forEach(el => el.disabled = false);
 }
+function cfgSliders() { return [ui.cfgC, ui.cfgT, ui.cfgB, ui.cfgSteps, ui.cfgLr]; }
 
-// 2-layer float target (matches the model shape) for a learnable task
-function target(X, h) {
-  const Wt1 = randn(DIN * h, mulberry32(42)), Wt2 = randn(h * DOUT, mulberry32(43));
-  const hpre = TrainCore.matmul(X, Wt1, NPER, DIN, h);
-  for (let i = 0; i < hpre.length; i++) hpre[i] = Math.max(0, hpre[i]);
-  return TrainCore.matmul(hpre, Wt2, NPER, h, DOUT);
-}
-
-// (re)build the model for a hidden size — deterministic shared init (same seeds
-// on every peer), fresh per-peer data shard
-function buildModel(h) {
-  D = { n: NPER, din: DIN, h, dout: DOUT };
-  W1 = randn(DIN * h, mulberry32(7));
-  W2 = randn(h * DOUT, mulberry32(8));
-  Xdata = randn(NPER * DIN);
-  Ydata = target(Xdata, h);
+// (re)build the mini transformer — deterministic shared init (same seeds on
+// every peer); each device samples its own batch windows from the shared corpus
+function buildModel(cfg) {
+  model = Transformer.init(cfg, L, compute.matmulInt8);
   trainedSteps = 0;
 }
 
@@ -387,9 +388,10 @@ function buildModel(h) {
   }
   ui.backend.textContent = `${compute.backend.toUpperCase()} — ${compute.label} · through verified INT8 units`;
   // slider readouts
-  for (const [el, v] of [[ui.cfgH, "vcfgH"], [ui.cfgSteps, "vcfgSteps"], [ui.cfgLr, "vcfgLr"]])
+  for (const [el, v] of [[ui.cfgC, "vcfgC"], [ui.cfgT, "vcfgT"], [ui.cfgB, "vcfgB"],
+                         [ui.cfgSteps, "vcfgSteps"], [ui.cfgLr, "vcfgLr"]])
     el.oninput = () => document.getElementById(v).textContent = el.value;
-  buildModel(+ui.cfgH.value);
+  buildModel(readCfgFromUI());
   ui.me.textContent = deviceName;
   if (room()) {
     ui.roomInfo.style.display = "";
@@ -404,7 +406,7 @@ function buildModel(h) {
   connectSignaling();
   ui.start.onclick = () => {
     const cfg = readCfgFromUI();
-    buildModel(cfg.h);
+    buildModel(cfg);
     broadcastConfig(cfg);                                // everyone follows these settings
     train(cfg);
   };

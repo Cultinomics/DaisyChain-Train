@@ -105,13 +105,17 @@
 
   <div class="card">
     <div class="lbl">🎛 Training settings</div>
-    <label class="slbl">Hidden units <span class="sval" id="vcfgH">16</span></label>
-    <input type="range" id="cfgH" min="8" max="64" step="8" value="16">
+    <label class="slbl">Model width <span class="sval" id="vcfgC">32</span></label>
+    <input type="range" id="cfgC" min="16" max="64" step="16" value="32">
+    <label class="slbl">Sequence length <span class="sval" id="vcfgT">32</span></label>
+    <input type="range" id="cfgT" min="16" max="64" step="16" value="32">
+    <label class="slbl">Batch per device <span class="sval" id="vcfgB">8</span></label>
+    <input type="range" id="cfgB" min="2" max="32" step="2" value="8">
     <label class="slbl">Steps <span class="sval" id="vcfgSteps">300</span></label>
-    <input type="range" id="cfgSteps" min="100" max="1000" step="100" value="300">
-    <label class="slbl">Learning rate ×100 <span class="sval" id="vcfgLr">20</span></label>
+    <input type="range" id="cfgSteps" min="100" max="10000" step="100" value="300">
+    <label class="slbl">Learning rate ×1000 <span class="sval" id="vcfgLr">20</span></label>
     <input type="range" id="cfgLr" min="5" max="50" step="5" value="20">
-    <p class="note" style="margin:.5rem 0 0">Whoever presses Start sets the settings for the whole group — every device follows automatically.</p>
+    <p class="note" style="margin:.5rem 0 0">A mini transformer language model — attention, MLP blocks, next-character prediction — every multiply through the verified INT8 units. Whoever presses Start sets the settings for the whole group; total batch scales with every device that joins.</p>
   </div>
 
   <div class="card" style="text-align:center">
@@ -147,6 +151,7 @@
 
   <script src="traincore.js"></script>
   <script src="verified_core.js"></script>
+  <script src="transformer.js"></script>
   <script src="webgpu.js"></script>
   <script src="app.js"></script>
 </body>
