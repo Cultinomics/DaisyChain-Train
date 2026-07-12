@@ -26,7 +26,7 @@ Two ways to run — **Docker** or **Python**.
 > Built by **DaisyChainAI**. Point it at your model + data and it trains across
 > whatever old machines you have, through the emulated GPU logic.
 
-**Repositories:** [GitHub](https://github.com/quzi93/old-hw-train) · [🤗 HuggingFace](https://huggingface.co/DaisyChainAI/old-hw-train)
+**Repositories:** [GitHub](https://github.com/quzi93/DaisyChain-Train) · [🤗 HuggingFace](https://huggingface.co/DaisyChainAI/DaisyChain-Train)
 
 ---
 
@@ -148,7 +148,7 @@ on **Windows use Docker/WSL** (see LIMITS).
   title        = {DaisyChain: An Old Hardware Training Pipeline},
   author       = {Byrne, Dean (Quazim0t0)},
   year         = {2026},
-  howpublished = {\url{https://huggingface.co/DaisyChainAI/old-hw-train}},
+  howpublished = {\url{https://huggingface.co/DaisyChainAI/DaisyChain-Train}},
   note         = {Chain spare/old machines into a data-parallel training cluster}
 }
 ```
