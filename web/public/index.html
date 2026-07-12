@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DaisyChain-Web — train by opening a page</title>
+<style>
+  :root {
+    --page-bg: #efe4c9;
+    --card-bg: #fbf6e8;
+    --card-border: rgba(139, 111, 71, 0.30);
+    --text: #2a1d0a;
+    --text-soft: #6b4423;
+    --accent: #4a7c2e;
+    --accent-deep: #2d5016;
+    --counter-bg: linear-gradient(135deg, #2d5016 0%, #1f3a0f 100%);
+    --counter-num: #f5ecd9;
+    --counter-label: #c9b072;
+    --btn: linear-gradient(135deg, #4a7c2e 0%, #2d5016 100%);
+    --btn-hover: linear-gradient(135deg, #5a8c3e 0%, #3d6020 100%);
+    --warn: #8b2e25;
+    --link: #4a7c2e;
+    --track: rgba(139, 111, 71, 0.22);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --page-bg: #14100a; --card-bg: #1f1a12; --card-border: rgba(201, 176, 114, 0.35);
+      --text: #ede1c3; --text-soft: #c9b072; --accent: #9bc466; --accent-deep: #6b9039;
+      --counter-bg: linear-gradient(135deg, #1a2e0d 0%, #0c1606 100%);
+      --counter-label: #c9b072; --warn: #ff9b8e; --link: #9bc466; --track: rgba(201,176,114,0.20);
+    }
+  }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+         max-width: 720px; margin: 0 auto; padding: 24px 18px 40px; line-height: 1.5;
+         background: var(--page-bg); color: var(--text); }
+  h1 { margin: 0 0 2px; font-size: 1.7rem; letter-spacing: .3px; }
+  .sub { color: var(--text-soft); margin: 0 0 18px; font-size: .92rem; }
+  .sub code { background: rgba(74,124,46,.12); padding: 1px 5px; border-radius: 4px; }
+  .card { background: var(--card-bg); border: 1px solid var(--card-border);
+          border-radius: 10px; padding: 14px 16px; margin: 12px 0;
+          box-shadow: 0 2px 10px rgba(0,0,0,0.06); }
+  .lbl { color: var(--text-soft); font-size: 11px; font-weight: 800; letter-spacing: 1.5px;
+         text-transform: uppercase; margin-bottom: 8px; }
+  .row { display: flex; justify-content: space-between; gap: 12px; padding: 3px 0; font-size: .95rem; }
+  .k { color: var(--text-soft); } .v { font-weight: 700; text-align: right; }
+  .device { font-family: 'Courier New', monospace; font-size: 1.5rem; font-weight: 700;
+            color: var(--accent-deep); }
+  @media (prefers-color-scheme: dark) { .device { color: var(--accent); } }
+  .counter { background: var(--counter-bg); border-radius: 10px; padding: 14px 16px; text-align: center; }
+  .counter .num { font-family: 'Courier New', monospace; font-size: 2.2rem; font-weight: 700; color: var(--counter-num); }
+  .counter .cl { color: var(--counter-label); font-size: 11px; text-transform: uppercase; letter-spacing: 1.5px; }
+  .track { width: 100%; height: 10px; border-radius: 6px; background: var(--track); overflow: hidden; margin-top: 12px; }
+  #bar { height: 10px; width: 0; background: linear-gradient(90deg, #6b9039, #9bc466); transition: width .25s; }
+  button { background: var(--btn); color: #f5ecd9; border: 0; border-radius: 8px;
+           padding: 12px 26px; font-weight: 800; font-size: 1rem; letter-spacing: .5px; cursor: pointer;
+           box-shadow: 0 3px 10px rgba(74,49,16,0.18); transition: .15s; }
+  button:hover:not(:disabled) { background: var(--btn-hover); box-shadow: 0 5px 14px rgba(74,49,16,0.28); }
+  button:disabled { background: #8b7d5e; opacity: .55; cursor: not-allowed; box-shadow: none; }
+  pre { background: rgba(0,0,0,0.05); border-radius: 8px; padding: 10px; max-height: 150px;
+        overflow: auto; font-size: .78rem; color: var(--text-soft); white-space: pre-wrap; margin: 0;
+        font-family: 'Courier New', monospace; }
+  @media (prefers-color-scheme: dark) { pre { background: rgba(0,0,0,0.25); } }
+  .note { color: var(--text-soft); font-size: .82rem; }
+  .note b { color: var(--warn); }
+  .diff { color: var(--accent-deep); font-weight: 600; font-size: .88rem; }
+  @media (prefers-color-scheme: dark) { .diff { color: var(--accent); } }
+</style>
+</head>
+<body>
+  <h1>🌼 DaisyChain-Web</h1>
+  <p class="sub">Open this on your other devices <b>on the same network</b> and they train a shared model together — peer-to-peer, right in the browser, through the emulated GPU logic. Only devices on your network are grouped (like Snapdrop). To invite people across networks, everyone opens <code>?room=YOUR-CODE</code> — the person who created the room approves each device before it can join.</p>
+
+  <div class="card">
+    <div class="lbl">🌲 This device</div>
+    <div class="device" id="me">—</div>
+    <div class="row" style="margin-top:8px"><span class="k">Status</span><span class="v" id="status">starting…</span></div>
+    <div class="row"><span class="k">Compute</span><span class="v" id="backend">detecting…</span></div>
+  </div>
+
+  <div class="card">
+    <div class="lbl">🍄 Devices in your group</div>
+    <div class="row"><span class="v" id="peers" style="text-align:left">(none yet)</span></div>
+    <div id="requests"></div>
+  </div>
+
+  <div class="card" style="text-align:center">
+    <button id="start" disabled>Start training</button>
+    <p class="note" style="margin:.6rem 0 0">Enabled once another device joins. (Or open a second tab to try it.)</p>
+  </div>
+
+  <div class="card">
+    <div class="lbl">✦ Training</div>
+    <div class="row"><span class="k">Step</span><span class="v" id="step">— / —</span></div>
+    <div class="counter" style="margin:10px 0"><div class="num" id="loss">—</div><div class="cl">cluster-avg loss · lower is better</div></div>
+    <div class="track"><div id="bar"></div></div>
+    <div class="row" style="margin-top:10px"><span class="diff" id="diff"></span></div>
+  </div>
+
+  <div class="card">
+    <div class="lbl">💾 Model checkpoint</div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;justify-content:center">
+      <button id="save" disabled>Download model (.pt)</button>
+      <button id="loadBtn">Load checkpoint…</button>
+      <input type="file" id="load" accept=".pt" style="display:none">
+    </div>
+    <p class="note" style="margin:.6rem 0 0;text-align:center">Loading a checkpoint applies it here <b>and</b> pushes it to every connected device — use it to recover the group after a failure.</p>
+  </div>
+
+  <div class="card">
+    <div class="lbl">❋ Log</div>
+    <pre id="log"></pre>
+  </div>
+
+  <p class="note">Needs a secure context (localhost or HTTPS) for WebGPU + cross-device WebRTC. No WebGPU? The same verified INT8 units run on CPU — old machines (e.g. via Supermium) still join, just slower. Every training step goes through the Neural Units; there is no plain-float path, and if the units fail to load, training is disabled.</p>
+  <p class="note"><b>Heads up:</b> peers connect directly (WebRTC), so devices in your group can see each other's IP address, and there's no gradient authentication — only train with devices/people you trust. Proof of concept.</p>
+
+  <script src="traincore.js"></script>
+  <script src="verified_core.js"></script>
+  <script src="webgpu.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

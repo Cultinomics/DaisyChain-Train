@@ -1,0 +1,14 @@
+{
+  "name": "daisychain-web",
+  "version": "0.1.0",
+  "description": "Train a shared model P2P in the browser — WebRTC mesh + WebGPU compute. Open a page, become a node.",
+  "license": "MIT",
+  "author": "Dean Byrne (Quazim0t0) / DaisyChainAI",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test_core.js"
+  },
+  "dependencies": {
+    "ws": "^8.21.0"
+  }
+}
