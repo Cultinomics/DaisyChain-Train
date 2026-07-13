@@ -93,7 +93,11 @@ function connectSignaling() {
   if (room()) params.set("room", room());                             // no code -> group by network
   ws = new WebSocket(`${proto}://${location.host}/?${params}`);
   ws.onopen = () => setStatus(room() ? `connected — private room "${room()}"` : "connected — grouping with devices on your network");
-  ws.onclose = () => { if (!wasDenied) setStatus("signaling disconnected"); };
+  ws.onclose = () => {
+    if (wasDenied) return;
+    setStatus("signaling disconnected — reconnecting…");
+    setTimeout(connectSignaling, 3000);        // data channels survive; rejoin the room
+  };
   ws.onmessage = async (ev) => {
     const msg = JSON.parse(ev.data);
     if (msg.type === "welcome") {
@@ -101,8 +105,9 @@ function connectSignaling() {
       if (msg.room) log(`group: ${msg.room.startsWith("net:") ? "your network" : "private room " + msg.room.replace("room:", "")}`);
       if (msg.host) { log("you host this room — joiners wait for your approval"); setStatus(`hosting private room "${room()}"`); }
       else if (room()) setStatus(`accepted into private room "${room()}"`);
-      // I'm newest: initiate to everyone already here
-      for (const p of msg.peers) { names.set(p.id, p.name); initiatePeer(p.id); }
+      // I'm newest: initiate to everyone already here (skip channels that
+      // survived a signaling blip — no duplicate connections)
+      for (const p of msg.peers) { names.set(p.id, p.name); if (!chans.has(p.id)) initiatePeer(p.id); }
       updatePeers();
     } else if (msg.type === "waiting") {
       setStatus("knocking — waiting for the room's host to let you in…");
@@ -153,9 +158,33 @@ function addJoinRequest(id, name) {
 function newPC(peerId) {
   const pc = new RTCPeerConnection({ iceServers: STUN });
   pc.onicecandidate = (e) => { if (e.candidate) signal(peerId, { candidate: e.candidate }); };
-  pc.onconnectionstatechange = () => { if (pc.connectionState === "failed") cleanupPeer(peerId); };
+  pc.onconnectionstatechange = () => {
+    if (pc.connectionState === "failed") { cleanupPeer(peerId); scheduleReconnect(peerId); }
+  };
   pcs.set(peerId, pc);
   return pc;
+}
+
+// ---- auto-reconnect ----------------------------------------------------------
+// If a data channel drops but the peer is still in the room (signaling knows
+// them), redial with backoff. Only the higher-numbered peer initiates, so both
+// sides don't collide (offer glare). If the peer truly left, names loses them
+// and the retries stop on their own.
+const reconnectTimers = new Map();             // peerId -> attempt count
+function scheduleReconnect(peerId, attempt = 0) {
+  if (!names.has(peerId) || chans.has(peerId) || reconnectTimers.has(peerId)) return;
+  if (attempt >= 6) { log(`gave up reconnecting to ${nmeOf(peerId)}`); return; }
+  const delay = 1500 * Math.pow(2, attempt);
+  reconnectTimers.set(peerId, setTimeout(() => {
+    reconnectTimers.delete(peerId);
+    if (!names.has(peerId) || chans.has(peerId)) return;
+    if (+myId.slice(1) > +peerId.slice(1)) {   // deterministic initiator
+      log(`reconnecting to ${nmeOf(peerId)} (attempt ${attempt + 1})…`);
+      cleanupPeer(peerId);
+      initiatePeer(peerId);
+    }
+    setTimeout(() => scheduleReconnect(peerId, attempt + 1), 6000);
+  }, delay));
 }
 function initiatePeer(peerId) {
   const pc = newPC(peerId);
@@ -191,11 +220,21 @@ async function onSignal(from, data) {
 }
 function setupChannel(peerId, dc) {
   dc.binaryType = "arraybuffer";
-  dc.onopen = () => { chans.set(peerId, dc); updatePeers(); log(`connected to ${nmeOf(peerId)}`); ui.start.disabled = false; };
-  dc.onclose = () => { chans.delete(peerId); updatePeers(); wake(); };
+  dc.onopen = () => {
+    chans.set(peerId, dc); updatePeers(); log(`connected to ${nmeOf(peerId)}`); ui.start.disabled = false;
+    // I'm leading a live run (leaderId null while training) — sync them in at
+    // the next step boundary instead of making them wait for the next run
+    if (training && leaderId === null) { pendingJoins.add(peerId); log(`${nmeOf(peerId)} will be synced into the running training`); }
+  };
+  dc.onclose = () => { chans.delete(peerId); updatePeers(); wake(); scheduleReconnect(peerId); };
   dc.onmessage = (e) => onGrad(peerId, e.data);
 }
-function cleanupPeer(id) { const pc = pcs.get(id); if (pc) pc.close(); pcs.delete(id); chans.delete(id); pendingCand.delete(id); wake(); }
+function cleanupPeer(id) {
+  const pc = pcs.get(id); if (pc) pc.close();
+  pcs.delete(id); chans.delete(id); pendingCand.delete(id); pendingJoins.delete(id);
+  for (const k of fragIn.keys()) if (k.startsWith(id + ":")) fragIn.delete(k);
+  wake();
+}
 
 // ---- checkpoints ------------------------------------------------------------
 // File layout (also the broadcast payload after the sentinel):
@@ -389,15 +428,67 @@ async function dcSend(dc, buf) {
     dc.send(msg);
   }
 }
-async function broadcast(buf) { for (const dc of chans.values()) if (dc.readyState === "open") await dcSend(dc, buf); }
+// parallel: one slow channel (e.g. a joiner mid-download of a resume bundle)
+// must not delay the gradient broadcast to everyone else
+function broadcast(buf) {
+  return Promise.all([...chans.values()].filter(dc => dc.readyState === "open").map(dc => dcSend(dc, buf)));
+}
+
+// ---- mid-run join: the leader ships weights + Adam state + step -------------
+// A device that connects (or reconnects) while training gets a resume bundle:
+//   [i32 -6][i32 startStep][i32 adamT][i32 c,t,b,steps][f32 lr]
+//   [f32 weights ×nP][f32 adam.m ×nP][f32 adam.v ×nP]
+// From that snapshot it applies the exact same roster updates as everyone else
+// (bit-identical), and its own gradients join the roster as soon as they
+// arrive on time — no restart of the run.
+const RESUME_SENTINEL = -6;
+const pendingJoins = new Set();                // peers to sync in at the next step boundary
+async function sendResume(peerId, startStep, opt, cfg) {
+  const dc = chans.get(peerId);
+  if (!dc || dc.readyState !== "open") return;
+  const st = opt.getState();                   // snapshot NOW (top of step, post-update)
+  const w = Transformer.getFlatParams(model);
+  const nP = w.length;
+  const buf = new ArrayBuffer(32 + nP * 12);
+  new Int32Array(buf, 0, 7).set([RESUME_SENTINEL, startStep, st.t, cfg.c, cfg.t, cfg.b, cfg.steps]);
+  new Float32Array(buf, 28, 1)[0] = cfg.lr;
+  new Float32Array(buf, 32, nP).set(w);
+  new Float32Array(buf, 32 + nP * 4, nP).set(st.m);
+  new Float32Array(buf, 32 + nP * 8, nP).set(st.v);
+  log(`syncing ${nmeOf(peerId)} into the run at step ${startStep + 1} (${(buf.byteLength / 1048576).toFixed(1)} MB state transfer)`);
+  await dcSend(dc, buf);
+}
+function onResume(peerId, buf) {
+  if (training) { log(`ignored resume bundle from ${nmeOf(peerId)} (already training)`); return; }
+  const iv = new Int32Array(buf, 0, 7);
+  const lr = Math.fround(new Float32Array(buf, 28, 1)[0]);
+  const cfg = { c: iv[3], t: iv[4], b: iv[5], steps: iv[6], lr };
+  if (!(cfg.c >= 16 && cfg.c <= 128 && cfg.t >= 16 && cfg.t <= 128 && cfg.b >= 1 && cfg.b <= 32 &&
+        cfg.steps >= 1 && cfg.steps <= 10000 && lr > 0 && lr <= 0.2)) {
+    log(`rejected bad resume bundle from ${nmeOf(peerId)}`); return;
+  }
+  buildModel(cfg); showCfgInUI(cfg);
+  const nP = model.nParams;
+  if (buf.byteLength !== 32 + nP * 12) { log(`resume bundle size mismatch from ${nmeOf(peerId)}`); return; }
+  Transformer.setFlatParams(model, new Float32Array(buf.slice(32, 32 + nP * 4)));
+  const adam = { m: new Float32Array(buf.slice(32 + nP * 4, 32 + nP * 8)),
+                 v: new Float32Array(buf.slice(32 + nP * 8)), t: iv[2] };
+  leaderId = peerId;
+  trainedSteps = iv[1];
+  log(`${nmeOf(peerId)} synced me into the running training at step ${iv[1] + 1} — joining the cohort`);
+  train(cfg, { startStep: iv[1], adam });
+}
 function onFragment(peerId, buf) {               // returns full message when complete
   const [, id, seq, total] = new Int32Array(buf, 0, 4);
-  let st = fragIn.get(peerId);
-  if (!st || st.id !== id) { st = { id, parts: [], got: 0, total }; fragIn.set(peerId, st); }
+  // key by message id too: a resume bundle and step gradients can interleave
+  // on the same channel, and each must reassemble independently
+  const key = peerId + ":" + id;
+  let st = fragIn.get(key);
+  if (!st) { st = { id, parts: [], got: 0, total }; fragIn.set(key, st); }
   st.parts[seq] = new Uint8Array(buf, 16).slice(0);
   st.got++;
   if (st.got < st.total) return null;
-  fragIn.delete(peerId);
+  fragIn.delete(key);
   let len = 0; for (const p of st.parts) len += p.length;
   const out = new Uint8Array(len);
   let off = 0; for (const p of st.parts) { out.set(p, off); off += p.length; }
@@ -444,6 +535,7 @@ function onGrad(peerId, buf) {
     return;
   }
   if (step === CFG_SENTINEL) { onConfig(peerId, buf); return; }
+  if (step === RESUME_SENTINEL) { onResume(peerId, buf); return; }
   if (step === CKPT_SENTINEL) {                  // a peer pushed a checkpoint
     if (training) { log(`ignored checkpoint from ${nmeOf(peerId)} (training in progress)`); return; }
     try { applyCheckpoint(parseCheckpoint(buf.slice(4)), nmeOf(peerId)); }
@@ -503,14 +595,18 @@ async function localStep() {
 }
 
 // ---- the training loop -----------------------------------------------------
-async function train(cfg) {
+async function train(cfg, resume) {
   if (training) return; training = true; ui.start.disabled = true;
   cfgSliders().forEach(el => el.disabled = true);
-  incoming.clear(); rosters.clear(); peerHashes.clear();  // no stale grads from a previous run
-  const iLead = leaderId === null;                     // set by Start (null) or onConfig (starter's id)
-  const cohort = [...chans.keys()];                    // lock the cohort (departed peers are pruned per-step)
+  // resume runs keep `incoming` — grads that arrived while the bundle was
+  // downloading are exactly the steps we need to catch up with
+  if (!resume) { incoming.clear(); rosters.clear(); peerHashes.clear(); }
+  const iLead = !resume && leaderId === null;          // set by Start (null) or onConfig/onResume
+  const cohort = [...chans.keys()];                    // grows when a synced-in peer starts contributing
   const steps = cfg.steps;
   const opt = TrainCore.makeAdam(model.nParams, { lr: cfg.lr });
+  if (resume) opt.setState(resume.adam);               // bit-identical moments from the leader
+  pendingJoins.clear();
   log(`training started — cohort ${cohort.length} peer(s), world ${cohort.length + 1}, ` +
       `width=${cfg.c} seq=${cfg.t} batch=${cfg.b}×${cohort.length + 1}, optimizer ${opt.name}` +
       (cohort.length ? `, sync ${iLead ? "led by me" : "led by " + nmeOf(leaderId)}` : "") +
@@ -523,18 +619,35 @@ async function train(cfg) {
   const contrib = new Map([[myId, 0]]);                // peerId -> grads contributed
   for (const id of cohort) contrib.set(id, 0);
   try {
-  for (let s = 0; s < steps; s++) {
+  for (let s = resume ? resume.startStep : 0; s < steps; s++) {
+    // leader: ship the current state to any device that connected mid-run —
+    // snapshot here (top of step, post-update) so their replay starts exact
+    if (iLead && pendingJoins.size) {
+      for (const pid of [...pendingJoins]) { pendingJoins.delete(pid); sendResume(pid, s, opt, cfg); }
+    }
     const whash = hashWeights();                       // pre-step fingerprint, sent with the grad
-    const { loss, grad } = await localStep();
-    await broadcastGrad(s, whash, loss, grad);
+    // catching up after a mid-run join: if the leader's roster for this step
+    // already exists and doesn't include me, skip the local compute — just
+    // apply the roster updates and race forward to the live step
+    const known = rosters.get(s);
+    const skipMine = !iLead && known && !known.includes(myId);
+    let loss = 0, grad = null;
+    if (!skipMine) {
+      ({ loss, grad } = await localStep());
+      await broadcastGrad(s, whash, loss, grad);
+    }
     let all;
-    if (!cohort.length) {
-      all = [grad];                                    // solo run
+    if (!cohort.length && iLead) {
+      all = [grad];                                    // solo run (joiners can still sync in)
     } else if (iLead) {
       const ids = await waitForGradIds(s, cohort);
+      // synced-in peers join the cohort the first step their grad shows up
+      const extra = [...((incoming.get(s) || new Map()).keys())]
+        .filter(id => !cohort.includes(id) && !ids.includes(id) && chans.has(id));
+      for (const e of extra) { cohort.push(e); contrib.set(e, contrib.get(e) || 0); log(`${nmeOf(e)} joined the training cohort at step ${s + 1}`); }
       // sync guard: publish the exact contributor set so every device
       // averages the same gradients (or stops) — never a silent fork
-      const roster = [myId, ...ids];
+      const roster = [myId, ...ids, ...extra];
       broadcastRoster(s, roster);
       rosters.set(s, roster);
       // CRITICAL: average strictly in roster order. Float addition is

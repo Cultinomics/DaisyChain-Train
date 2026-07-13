@@ -85,6 +85,11 @@
         }
         return u;
       },
+      // snapshot/restore the moments — this is what lets a device that joins
+      // mid-run become bit-identical with the group (weights alone are not
+      // enough; Adam's m/v/t must match too)
+      getState() { return { m: Float32Array.from(m), v: Float32Array.from(v), t }; },
+      setState(s) { m.set(s.m); v.set(s.v); t = s.t; },
     };
   }
 
