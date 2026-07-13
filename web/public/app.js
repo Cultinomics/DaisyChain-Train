@@ -37,6 +37,7 @@ const ui = {
   cfgB: document.getElementById("cfgB"),
   cfgSteps: document.getElementById("cfgSteps"),
   cfgLr: document.getElementById("cfgLr"),
+  cfgData: document.getElementById("cfgData"),
   dataset: document.getElementById("dataset"),
   tokenizer: document.getElementById("tokenizer"),
   kit: document.getElementById("kit"),
@@ -173,7 +174,13 @@ function newPC(peerId) {
 const reconnectTimers = new Map();             // peerId -> attempt count
 function scheduleReconnect(peerId, attempt = 0) {
   if (!names.has(peerId) || chans.has(peerId) || reconnectTimers.has(peerId)) return;
-  if (attempt >= 6) { log(`gave up reconnecting to ${nmeOf(peerId)}`); return; }
+  if (attempt >= 5) {                          // 5 tries, then they're out of the group
+    log(`${nmeOf(peerId)} unreachable after 5 reconnect attempts — removed from the group`);
+    cleanupPeer(peerId);
+    names.delete(peerId);
+    updatePeers();
+    return;
+  }
   const delay = 1500 * Math.pow(2, attempt);
   reconnectTimers.set(peerId, setTimeout(() => {
     reconnectTimers.delete(peerId);
@@ -353,26 +360,51 @@ function readCfgFromUI() {
   // lr crosses the wire as float32 — fround here so the leader trains with
   // the exact same value the followers decode (else Adam forks the weights)
   return { c: +ui.cfgC.value, t: +ui.cfgT.value, b: +ui.cfgB.value,
-           steps: +ui.cfgSteps.value, lr: Math.fround(+ui.cfgLr.value / 1000) };
+           steps: +ui.cfgSteps.value, lr: Math.fround(+ui.cfgLr.value / 1000),
+           ds: (ui.cfgData.value || "").trim() };
 }
 function showCfgInUI(cfg) {
   const set = (el, vid, val) => { el.value = val; document.getElementById(vid).textContent = val; };
   set(ui.cfgC, "vcfgC", cfg.c); set(ui.cfgT, "vcfgT", cfg.t); set(ui.cfgB, "vcfgB", cfg.b);
   set(ui.cfgSteps, "vcfgSteps", cfg.steps);
   set(ui.cfgLr, "vcfgLr", Math.round(cfg.lr * 1000));
+  if (cfg.ds) ui.cfgData.value = cfg.ds;
+}
+// switch the training text to a chosen dataset (whole group uses the same one);
+// on failure the built-in corpus stays and we log why
+async function loadDataset(ds) {
+  if (!ds) return;
+  ui.dataset.textContent = `streaming ${ds}…`;
+  try {
+    const { name, chars } = await Transformer.streamDataset(ds);
+    ui.dataset.textContent = name;
+    log(`dataset: ${name} — ${(chars / 1000).toFixed(0)}k chars (this device's own slice)`);
+  } catch (e) {
+    ui.dataset.textContent = "built-in corpus";
+    log(`dataset "${ds}" unavailable (${e.message}) — using the built-in corpus`);
+  }
 }
 function broadcastConfig(cfg) {
-  const buf = new ArrayBuffer(28);
+  const dsBytes = new TextEncoder().encode((cfg.ds || "").slice(0, 96));
+  const buf = new ArrayBuffer(32 + dsBytes.length);
   new Int32Array(buf, 0, 5).set([CFG_SENTINEL, cfg.c, cfg.t, cfg.b, cfg.steps]);
   new Float32Array(buf, 20, 1)[0] = cfg.lr;
   new Int32Array(buf, 24, 1)[0] = Transformer.vocabSize();   // tokenizer must match
+  new Int32Array(buf, 28, 1)[0] = dsBytes.length;
+  new Uint8Array(buf, 32).set(dsBytes);
   broadcast(buf);
 }
-function onConfig(peerId, buf) {
+async function onConfig(peerId, buf) {
   if (training) { log(`ignored settings from ${nmeOf(peerId)} (already training)`); return; }
   const [, c, t, b, steps] = new Int32Array(buf, 0, 5);
   const lr = new Float32Array(buf, 20, 1)[0];
   const vocab = buf.byteLength >= 28 ? new Int32Array(buf, 24, 1)[0] : -1;
+  let ds = "";
+  if (buf.byteLength >= 32) {
+    const dsLen = new Int32Array(buf, 28, 1)[0];
+    if (dsLen > 0 && dsLen <= 96 && buf.byteLength === 32 + dsLen)
+      ds = new TextDecoder().decode(new Uint8Array(buf, 32, dsLen));
+  }
   if (vocab !== Transformer.vocabSize()) {
     log(`NOT JOINING: ${nmeOf(peerId)} uses a ${vocab}-token tokenizer, this device has ` +
         `${Transformer.vocabSize()} (${Transformer.tokenizerName()}) — refresh so all devices match`);
@@ -382,10 +414,12 @@ function onConfig(peerId, buf) {
         steps >= 1 && steps <= 10000 && lr > 0 && lr <= 0.2)) {
     log(`rejected bad settings from ${nmeOf(peerId)}`); return;
   }
-  const cfg = { c, t, b, steps, lr };
+  const cfg = { c, t, b, steps, lr: Math.fround(lr), ds };
   leaderId = peerId;                           // the starter leads sync for this run
   showCfgInUI(cfg);
-  log(`${nmeOf(peerId)} started the group: width=${c}, seq=${t}, batch=${b}, ${steps} steps, lr=${lr}`);
+  log(`${nmeOf(peerId)} started the group: width=${c}, seq=${t}, batch=${b}, ${steps} steps, lr=${lr}` +
+      (ds ? `, dataset=${ds}` : ""));
+  if (ds) await loadDataset(ds);               // same dataset as the starter
   buildModel(cfg);
   train(cfg);                                  // follow automatically
 }
@@ -601,7 +635,10 @@ async function train(cfg, resume) {
   // resume runs keep `incoming` — grads that arrived while the bundle was
   // downloading are exactly the steps we need to catch up with
   if (!resume) { incoming.clear(); rosters.clear(); peerHashes.clear(); }
-  const iLead = !resume && leaderId === null;          // set by Start (null) or onConfig/onResume
+  let iLead = !resume && leaderId === null;            // set by Start (null) or onConfig/onResume
+  let lastRoster = null;                               // the promotion electorate: last applied roster
+  let lastLocal = null;                                // this step's own grad (reused on failover redo)
+  const deadLeaders = new Set();                       // leaders that left this run
   const cohort = [...chans.keys()];                    // grows when a synced-in peer starts contributing
   const steps = cfg.steps;
   const opt = TrainCore.makeAdam(model.nParams, { lr: cfg.lr });
@@ -633,8 +670,16 @@ async function train(cfg, resume) {
     const skipMine = !iLead && known && !known.includes(myId);
     let loss = 0, grad = null;
     if (!skipMine) {
-      ({ loss, grad } = await localStep());
-      await broadcastGrad(s, whash, loss, grad);
+      // compute each step's gradient EXACTLY once: a leader-failover redo
+      // must reuse the grad already broadcast — recomputing would give peers
+      // a different gradient than the one they hold, forking the weights
+      if (lastLocal && lastLocal.s === s) {
+        ({ loss, grad } = lastLocal);
+      } else {
+        ({ loss, grad } = await localStep());
+        lastLocal = { s, loss, grad };
+        await broadcastGrad(s, whash, loss, grad);
+      }
     }
     let all;
     if (!cohort.length && iLead) {
@@ -659,9 +704,28 @@ async function train(cfg, resume) {
       // follower: apply the leader's roster verbatim, or stop
       await waitFor(() => rosters.has(s) || !chans.has(leaderId), 15000);
       if (!rosters.has(s)) {
-        halted = chans.has(leaderId)
-          ? `no roster from ${nmeOf(leaderId)} for step ${s + 1}`
-          : `the sync leader (${nmeOf(leaderId)}) disconnected`;
+        if (!chans.has(leaderId)) {
+          // leader failover: everyone promotes the same next peer — the
+          // lowest-numbered member of the LAST APPLIED roster (identical on
+          // every device) that hasn't already died as leader. All followers
+          // hold bit-identical weights + Adam state, so the new leader
+          // continues the run seamlessly; no state transfer needed.
+          deadLeaders.add(leaderId);
+          const electorate = (lastRoster || [myId, leaderId]);
+          const next = electorate.filter(id => !deadLeaders.has(id))
+                                 .sort((a, b) => +a.slice(1) - +b.slice(1))[0];
+          if (!next) { halted = "the sync leader left and no one remains to promote"; break; }
+          if (next === myId) {
+            iLead = true; leaderId = null;
+            cohort.length = 0; cohort.push(...chans.keys());
+            log(`the leader left — I take over sync leadership at step ${s + 1} (cohort ${cohort.length})`);
+          } else {
+            leaderId = next;
+            log(`the leader left — ${nmeOf(next)} takes over sync from step ${s + 1}`);
+          }
+          s--; continue;                       // redo this step under the new leader
+        }
+        halted = `no roster from ${nmeOf(leaderId)} for step ${s + 1}`;
         break;
       }
       const roster = rosters.get(s);
@@ -678,6 +742,7 @@ async function train(cfg, resume) {
     // divergence check: every contributor's pre-step weight hash must match mine
     const hs = peerHashes.get(s);
     const roster = rosters.get(s) || [myId];
+    lastRoster = roster;                               // promotion electorate if the leader dies
     if (hs) {
       const bad = roster.find(id => id !== myId && hs.has(id) && hs.get(id).hash !== whash);
       if (bad) { halted = `weights diverged from ${nmeOf(bad)} (detected at step ${s + 1})`; break; }
@@ -822,17 +887,13 @@ function buildModel(cfg) {
   }
   updatePeers();
   connectSignaling();
-  // dataset: stream FineWeb-Edu from HuggingFace; built-in corpus if offline
-  ui.dataset.textContent = "streaming FineWeb-Edu…";
-  Transformer.streamFineWebEdu().then(({ name, chars }) => {
-    ui.dataset.textContent = "FineWeb-Edu (streamed)";
-    log(`dataset: ${name} — ${(chars / 1000).toFixed(0)}k chars loaded (each device streams its own slice)`);
-  }).catch((e) => {
-    ui.dataset.textContent = "built-in corpus (offline)";
-    log(`dataset: FineWeb-Edu stream unavailable (${e.message}) — using the built-in corpus`);
-  });
-  ui.start.onclick = () => {
+  // dataset: stream the chosen dataset from HuggingFace; built-in corpus if offline
+  loadDataset((ui.cfgData.value || "").trim());
+  ui.start.onclick = async () => {
+    if (training) return;
     const cfg = readCfgFromUI();
+    ui.start.disabled = true;
+    if (cfg.ds) await loadDataset(cfg.ds);               // my pick becomes the group's dataset
     leaderId = null;                                     // I pressed Start: I lead sync
     buildModel(cfg);
     broadcastConfig(cfg);                                // everyone follows these settings

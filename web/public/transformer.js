@@ -87,24 +87,28 @@
   let IDS = encode(CORPUS);
   let DATASET = "built-in corpus";
 
-  // Stream real training text: FineWeb-Edu, via the public HuggingFace
-  // datasets-server rows API. Each device pulls its own random slice (that's
-  // data parallelism — batches were always per-device anyway). Offline or on
-  // API failure the built-in corpus stays in place.
-  async function streamFineWebEdu() {
+  // Stream real training text from any public HuggingFace dataset with a
+  // `text` column, via the datasets-server rows API. Each device pulls its own
+  // random slice (that's data parallelism — batches were always per-device
+  // anyway). Offline or on API failure the built-in corpus stays in place.
+  const DEFAULT_DS = "HuggingFaceFW/fineweb-edu";
+  async function streamDataset(ds) {
+    ds = (ds || DEFAULT_DS).trim();
+    if (!/^[\w.-]+\/[\w.-]+$/.test(ds)) throw new Error(`invalid dataset id "${ds}"`);
     const offset = Math.floor(Math.random() * 9900);
-    const url = "https://datasets-server.huggingface.co/rows?dataset=HuggingFaceFW%2Ffineweb-edu" +
+    const url = `https://datasets-server.huggingface.co/rows?dataset=${encodeURIComponent(ds)}` +
                 `&config=default&split=train&offset=${offset}&length=100`;
     const r = await fetch(url);
     if (!r.ok) throw new Error(`datasets-server HTTP ${r.status}`);
     const j = await r.json();
-    const text = j.rows.map(x => x.row.text).join("\n").replace(/[^\x20-\x7e\n]/g, " ");
-    if (text.length < 10000) throw new Error("too little text returned");
+    const text = j.rows.map(x => String(x.row.text ?? "")).join("\n").replace(/[^\x20-\x7e\n]/g, " ");
+    if (text.length < 10000) throw new Error("too little text returned (does the dataset have a `text` column?)");
     CORPUS = text.slice(0, 500000);
     IDS = encode(CORPUS);
-    DATASET = "FineWeb-Edu (streamed from HuggingFace)";
+    DATASET = `${ds} (streamed)`;
     return { name: DATASET, chars: CORPUS.length };
   }
+  const streamFineWebEdu = () => streamDataset(DEFAULT_DS);
   function datasetName() { return DATASET; }
 
   // ---- verified matmul: float in -> quantize -> LUT multiply -> dequant -----
@@ -373,7 +377,7 @@
   }
 
   const api = { init, trainStep, applyUpdate, getFlatParams, setFlatParams, generate,
-                streamFineWebEdu, datasetName, loadTokenizer, loadTokenizerData,
+                streamFineWebEdu, streamDataset, datasetName, loadTokenizer, loadTokenizerData,
                 vocabSize, tokenizerName, encode, decode };
   if (typeof module !== "undefined" && module.exports) { TC = require("./traincore.js"); V = require("./verified_core.js"); module.exports = api; }
   else { TC = root.TrainCore; V = root.Verified; root.Transformer = api; }
