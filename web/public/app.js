@@ -29,6 +29,12 @@ const ui = {
   cfgB: document.getElementById("cfgB"),
   cfgSteps: document.getElementById("cfgSteps"),
   cfgLr: document.getElementById("cfgLr"),
+  dataset: document.getElementById("dataset"),
+  tokenizer: document.getElementById("tokenizer"),
+  kit: document.getElementById("kit"),
+  genPrompt: document.getElementById("genPrompt"),
+  genBtn: document.getElementById("genBtn"),
+  genOut: document.getElementById("genOut"),
 };
 function log(m) { ui.log.textContent = `${new Date().toLocaleTimeString()}  ${m}\n` + ui.log.textContent; }
 function setStatus(s) { ui.status.textContent = s; }
@@ -52,10 +58,24 @@ const names = new Map();                       // peerId -> device name
 const incoming = new Map();                    // step -> Map(peerId -> Float32Array)
 let model = null, training = false;            // the mini transformer (transformer.js)
 let trainedSteps = 0;                          // steps baked into the current weights
+// ---- sync guard state -------------------------------------------------------
+// The peer that presses Start is the round leader. Every step the leader
+// publishes the exact set of contributors to average (the roster); followers
+// apply that set verbatim or stop — no device may silently average a
+// different set, which is what used to fork the weights.
+let leaderId = null;                           // null => I lead (I pressed Start)
+const rosters = new Map();                     // step -> [peerId,...] from the leader
+const peerHashes = new Map();                  // step -> Map(peerId -> uint32 pre-step weight hash)
 function nmeOf(id) { return names.get(id) || id; }
 
 function room() { return new URLSearchParams(location.search).get("room"); }   // null -> group by network
-function updatePeers() { ui.peers.textContent = chans.size ? [...chans.keys()].map(nmeOf).join(", ") : "(none yet)"; }
+// show EVERY device the room knows about, not just open data channels —
+// a peer whose WebRTC is still connecting (or failed) must stay visible
+function updatePeers() {
+  if (!names.size) { ui.peers.textContent = "(none yet)"; return; }
+  ui.peers.textContent = [...names.entries()]
+    .map(([id, n]) => `${n} ${chans.has(id) ? "✓" : "(connecting…)"}`).join(", ");
+}
 
 // ---- signaling + WebRTC ----------------------------------------------------
 function connectSignaling() {
@@ -75,6 +95,7 @@ function connectSignaling() {
       else if (room()) setStatus(`accepted into private room "${room()}"`);
       // I'm newest: initiate to everyone already here
       for (const p of msg.peers) { names.set(p.id, p.name); initiatePeer(p.id); }
+      updatePeers();
     } else if (msg.type === "waiting") {
       setStatus("knocking — waiting for the room's host to let you in…");
     } else if (msg.type === "denied") {
@@ -88,6 +109,7 @@ function connectSignaling() {
       addJoinRequest(msg.id, msg.name);
     } else if (msg.type === "peer-joined") {
       names.set(msg.id, msg.name);
+      updatePeers();
       log(`${msg.name} joined (they will connect to me)`);
     } else if (msg.type === "peer-left") {
       log(`${nmeOf(msg.id)} left`); cleanupPeer(msg.id); names.delete(msg.id); updatePeers();
@@ -173,8 +195,10 @@ function parseCheckpoint(buf) {
   const magic = String.fromCharCode(...new Uint8Array(buf, 0, 8));
   if (magic !== CKPT_MAGIC) throw new Error("not a DaisyChain v2 checkpoint");
   const [c, t, vocab, steps] = new Int32Array(buf, 8, 4);
-  if (vocab !== Transformer.VOCAB) throw new Error(`vocab mismatch (file ${vocab}, this build ${Transformer.VOCAB})`);
-  if (c < 16 || c > 64 || t < 16 || t > 64) throw new Error(`bad dims in checkpoint (width ${c}, seq ${t})`);
+  if (vocab !== Transformer.vocabSize())
+    throw new Error(`tokenizer mismatch — checkpoint has a ${vocab}-token vocab, this device loaded ` +
+                    `${Transformer.vocabSize()} (${Transformer.tokenizerName()}); use matching builds`);
+  if (c < 16 || c > 128 || t < 16 || t > 128) throw new Error(`bad dims in checkpoint (width ${c}, seq ${t})`);
   return { c, t, steps, flat: new Float32Array(buf.slice(24)) };
 }
 function applyCheckpoint(ck, from) {
@@ -185,7 +209,7 @@ function applyCheckpoint(ck, from) {
   if (ck.flat.length !== model.nParams) throw new Error("truncated checkpoint");
   Transformer.setFlatParams(model, ck.flat);
   trainedSteps = ck.steps;
-  ui.save.disabled = false;
+  modelReady();
   ui.step.textContent = `${ck.steps} baked in`;
   log(`checkpoint loaded (${ck.steps} steps) ${from ? "from " + from : "from file"} — all set to resume`);
 }
@@ -195,9 +219,65 @@ function broadcastCheckpoint() {
   new Int32Array(msg, 0, 1)[0] = CKPT_SENTINEL;
   new Uint8Array(msg, 4).set(new Uint8Array(ck));
   let n = 0;
-  for (const dc of chans.values()) if (dc.readyState === "open") { dc.send(msg); n++; }
-  log(`checkpoint pushed to ${n} device(s)`);
+  for (const dc of chans.values()) if (dc.readyState === "open") { dcSend(dc, msg); n++; }
+  log(`checkpoint pushed to ${n} device(s) (${(msg.byteLength / 1048576).toFixed(1)} MB)`);
 }
+// ---- inference kit: one self-contained HTML file with the trained weights --
+// Bundles the model code + current checkpoint (base64) + a prompt box into a
+// single file that runs generations offline — no server, nothing to install.
+// The mul8 LUT is rebuilt in the file itself (it is exactly a×b for int8).
+async function downloadInferenceKit() {
+  const srcs = await Promise.all(["traincore.js", "verified_core.js", "transformer.js"]
+    .map(f => fetch(f).then(r => r.text())));
+  let tokData = "null";                          // embed the tokenizer (offline file)
+  try { tokData = await (await fetch("tokenizer.json")).text(); } catch (e) {}
+  const ck = new Uint8Array(packCheckpoint());
+  let b64 = ""; const CH = 0x8000;
+  for (let i = 0; i < ck.length; i += CH) b64 += String.fromCharCode(...ck.subarray(i, i + CH));
+  b64 = btoa(b64);
+  const esc = (s) => s.replace(/<\/script/gi, "<\\/script");
+  const html = `<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DaisyChain inference — ${trainedSteps} steps</title>
+<style>body{font-family:sans-serif;max-width:680px;margin:0 auto;padding:24px 16px;background:#efe4c9;color:#2a1d0a}
+input{width:100%;padding:10px;border-radius:8px;border:1px solid #8b6f47;font-family:monospace;box-sizing:border-box}
+button{margin-top:10px;padding:10px 24px;border:0;border-radius:8px;background:#4a7c2e;color:#f5ecd9;font-weight:700;cursor:pointer}
+pre{background:#fbf6e8;border-radius:8px;padding:12px;white-space:pre-wrap;min-height:60px}</style></head><body>
+<h2>🌼 DaisyChain model — inference</h2>
+<p>Trained ${trainedSteps} steps · width ${model.cfg.c} · seq ${model.cfg.t} · dataset: ${Transformer.datasetName()}.
+Runs entirely in this file through the verified INT8 units (CPU LUT).</p>
+<input id="p" value="the "><button id="g">Generate</button><pre id="o"></pre>
+<script>${esc(srcs[0])}<\/script><script>${esc(srcs[1])}<\/script><script>${esc(srcs[2])}<\/script>
+<script>
+const mul = new Int16Array(65536);
+for (let a = 0; a < 256; a++) for (let b = 0; b < 256; b++)
+  mul[a*256+b] = ((a>127?a-256:a) * (b>127?b-256:b));
+const L = { mul };
+const TOKDATA = ${esc(tokData)};
+if (TOKDATA) Transformer.loadTokenizerData(TOKDATA);
+const bytes = Uint8Array.from(atob("${b64}"), c => c.charCodeAt(0));
+const buf = bytes.buffer;
+const dims = new Int32Array(buf, 8, 4);            // c, t, vocab, steps
+const m = Transformer.init({ c: dims[0], t: dims[1], b: 1, steps: 0, lr: 0 }, L,
+  (Xq, Wq, mm, kk, nn, LL) => Verified.lutMatmulJS(Xq, Wq, mm, kk, nn, LL));
+Transformer.setFlatParams(m, new Float32Array(buf.slice(24)));
+document.getElementById("g").onclick = async () => {
+  const b = document.getElementById("g"), o = document.getElementById("o");
+  b.disabled = true; o.textContent = "generating…";
+  try { o.textContent = await Transformer.generate(m, document.getElementById("p").value || "the ", 150); }
+  catch (e) { o.textContent = "error: " + e.message; }
+  b.disabled = false;
+};
+<\/script></body></html>`;
+  const blob = new Blob([html], { type: "text/html" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `daisychain-inference-step${trainedSteps}.html`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+  log("inference kit downloaded — a single HTML file: open it anywhere, type a prompt, generate");
+}
+
 function saveCheckpoint() {
   const blob = new Blob([packCheckpoint()], { type: "application/octet-stream" });
   const a = document.createElement("a");
@@ -210,8 +290,10 @@ function saveCheckpoint() {
 // ---- training config: whoever presses Start sets it for the whole group ----
 const CFG_SENTINEL = -3;                       // wire: [int32 -3][int32 c,t,b,steps][f32 lr]
 function readCfgFromUI() {
+  // lr crosses the wire as float32 — fround here so the leader trains with
+  // the exact same value the followers decode (else Adam forks the weights)
   return { c: +ui.cfgC.value, t: +ui.cfgT.value, b: +ui.cfgB.value,
-           steps: +ui.cfgSteps.value, lr: +ui.cfgLr.value / 1000 };
+           steps: +ui.cfgSteps.value, lr: Math.fround(+ui.cfgLr.value / 1000) };
 }
 function showCfgInUI(cfg) {
   const set = (el, vid, val) => { el.value = val; document.getElementById(vid).textContent = val; };
@@ -220,37 +302,109 @@ function showCfgInUI(cfg) {
   set(ui.cfgLr, "vcfgLr", Math.round(cfg.lr * 1000));
 }
 function broadcastConfig(cfg) {
-  const buf = new ArrayBuffer(24);
+  const buf = new ArrayBuffer(28);
   new Int32Array(buf, 0, 5).set([CFG_SENTINEL, cfg.c, cfg.t, cfg.b, cfg.steps]);
   new Float32Array(buf, 20, 1)[0] = cfg.lr;
-  for (const dc of chans.values()) if (dc.readyState === "open") dc.send(buf);
+  new Int32Array(buf, 24, 1)[0] = Transformer.vocabSize();   // tokenizer must match
+  broadcast(buf);
 }
 function onConfig(peerId, buf) {
   if (training) { log(`ignored settings from ${nmeOf(peerId)} (already training)`); return; }
   const [, c, t, b, steps] = new Int32Array(buf, 0, 5);
   const lr = new Float32Array(buf, 20, 1)[0];
-  if (!(c >= 16 && c <= 64 && c % 2 === 0 && t >= 16 && t <= 64 && b >= 1 && b <= 32 &&
+  const vocab = buf.byteLength >= 28 ? new Int32Array(buf, 24, 1)[0] : -1;
+  if (vocab !== Transformer.vocabSize()) {
+    log(`NOT JOINING: ${nmeOf(peerId)} uses a ${vocab}-token tokenizer, this device has ` +
+        `${Transformer.vocabSize()} (${Transformer.tokenizerName()}) — refresh so all devices match`);
+    return;
+  }
+  if (!(c >= 16 && c <= 128 && c % 2 === 0 && t >= 16 && t <= 128 && b >= 1 && b <= 32 &&
         steps >= 1 && steps <= 10000 && lr > 0 && lr <= 0.2)) {
     log(`rejected bad settings from ${nmeOf(peerId)}`); return;
   }
   const cfg = { c, t, b, steps, lr };
+  leaderId = peerId;                           // the starter leads sync for this run
   showCfgInUI(cfg);
   log(`${nmeOf(peerId)} started the group: width=${c}, seq=${t}, batch=${b}, ${steps} steps, lr=${lr}`);
   buildModel(cfg);
   train(cfg);                                  // follow automatically
 }
 
-// ---- gradient wire format:  [int32 step][float32 grad...] -----------------
-function packGrad(step, grad) {
-  const buf = new ArrayBuffer(4 + grad.byteLength);
+// ---- big-message fragmentation ----------------------------------------------
+// WebRTC data channels cap a single message (~256KB Chrome, 64KB elsewhere).
+// Gradients with the Spikewhale vocab are multi-MB, and checkpoints always
+// were at width ≥ 64 — so anything large goes out in 48KB chunks:
+//   [int32 -5][int32 msgId][int32 seq][int32 total][bytes...]
+// Channels are ordered+reliable, so chunks arrive in order per peer.
+const FRAG_SENTINEL = -5, FRAG_CHUNK = 48 * 1024;
+let fragSeq = 1;
+const fragIn = new Map();                        // peerId -> {id, parts, got, total}
+function dcSend(dc, buf) {
+  if (buf.byteLength <= FRAG_CHUNK) { dc.send(buf); return; }
+  const id = fragSeq++, src = new Uint8Array(buf);
+  const total = Math.ceil(src.length / FRAG_CHUNK);
+  for (let s = 0; s < total; s++) {
+    const part = src.subarray(s * FRAG_CHUNK, Math.min((s + 1) * FRAG_CHUNK, src.length));
+    const msg = new ArrayBuffer(16 + part.length);
+    new Int32Array(msg, 0, 4).set([FRAG_SENTINEL, id, s, total]);
+    new Uint8Array(msg, 16).set(part);
+    dc.send(msg);
+  }
+}
+function broadcast(buf) { for (const dc of chans.values()) if (dc.readyState === "open") dcSend(dc, buf); }
+function onFragment(peerId, buf) {               // returns full message when complete
+  const [, id, seq, total] = new Int32Array(buf, 0, 4);
+  let st = fragIn.get(peerId);
+  if (!st || st.id !== id) { st = { id, parts: [], got: 0, total }; fragIn.set(peerId, st); }
+  st.parts[seq] = new Uint8Array(buf, 16).slice(0);
+  st.got++;
+  if (st.got < st.total) return null;
+  fragIn.delete(peerId);
+  let len = 0; for (const p of st.parts) len += p.length;
+  const out = new Uint8Array(len);
+  let off = 0; for (const p of st.parts) { out.set(p, off); off += p.length; }
+  return out.buffer;
+}
+
+// ---- gradient wire format: [int32 step][uint32 whash][f32 loss][f32 grad...]
+// whash = FNV-1a of the sender's weights BEFORE this step's update, so every
+// peer can verify the whole group is still training the same model.
+// loss = the sender's local batch loss, so everyone can show the true
+// cluster-average loss and log what each device contributes.
+function packGrad(step, whash, loss, grad) {
+  const buf = new ArrayBuffer(12 + grad.byteLength);
   new Int32Array(buf, 0, 1)[0] = step;
-  new Float32Array(buf, 4).set(grad);
+  new Uint32Array(buf, 4, 1)[0] = whash;
+  new Float32Array(buf, 8, 1)[0] = loss;
+  new Float32Array(buf, 12).set(grad);
   return buf;
+}
+function hashWeights() {                        // FNV-1a over the flat param bytes
+  const f = Transformer.getFlatParams(model);
+  const b = new Uint8Array(f.buffer, f.byteOffset, f.byteLength);
+  let h = 0x811c9dc5;
+  for (let i = 0; i < b.length; i++) { h ^= b[i]; h = Math.imul(h, 0x01000193); }
+  return h >>> 0;
+}
+// roster wire: [int32 -4][int32 step][int32 n][int32 peerNums...]
+const ROSTER_SENTINEL = -4;
+function broadcastRoster(step, ids) {
+  const nums = ids.map(id => +id.slice(1));     // "p12" -> 12
+  const buf = new ArrayBuffer(12 + 4 * nums.length);
+  const iv = new Int32Array(buf);
+  iv[0] = ROSTER_SENTINEL; iv[1] = step; iv[2] = nums.length;
+  iv.set(nums, 3);
+  broadcast(buf);
 }
 const waiters = new Set();                       // pending waitForGrads checkers
 function wake() { for (const w of waiters) w(); }
 function onGrad(peerId, buf) {
   const step = new Int32Array(buf, 0, 1)[0];
+  if (step === FRAG_SENTINEL) {                  // chunk of a large message
+    const whole = onFragment(peerId, buf);
+    if (whole) onGrad(peerId, whole);
+    return;
+  }
   if (step === CFG_SENTINEL) { onConfig(peerId, buf); return; }
   if (step === CKPT_SENTINEL) {                  // a peer pushed a checkpoint
     if (training) { log(`ignored checkpoint from ${nmeOf(peerId)} (training in progress)`); return; }
@@ -258,33 +412,50 @@ function onGrad(peerId, buf) {
     catch (e) { log(`bad checkpoint from ${nmeOf(peerId)}: ${e.message}`); }
     return;
   }
-  const grad = new Float32Array(buf.slice(4));
+  if (step === ROSTER_SENTINEL) {                // the leader's contributor set for a step
+    if (training && peerId !== leaderId) return;  // only the run's leader may steer sync
+    const iv = new Int32Array(buf);
+    rosters.set(iv[1], [...iv.slice(3, 3 + iv[2])].map(n => "p" + n));
+    wake(); return;
+  }
+  const whash = new Uint32Array(buf, 4, 1)[0];
+  const loss = new Float32Array(buf, 8, 1)[0];
+  const grad = new Float32Array(buf.slice(12));
   if (!incoming.has(step)) incoming.set(step, new Map());
   incoming.get(step).set(peerId, grad);
+  if (!peerHashes.has(step)) peerHashes.set(step, new Map());
+  peerHashes.get(step).set(peerId, { hash: whash, loss });
   wake();                                        // resolve waits immediately (no polling)
 }
-function broadcastGrad(step, grad) { const b = packGrad(step, grad); for (const dc of chans.values()) if (dc.readyState === "open") dc.send(b); }
+function broadcastGrad(step, whash, loss, grad) { broadcast(packGrad(step, whash, loss, grad)); }
 // Event-driven: re-checked on every gradient arrival and peer departure, plus a
 // coarse fallback timer (background tabs throttle timers to ~1s, so the old
 // 15ms poll was the bottleneck there). Peers that left are dropped from the
 // wait — a device dying no longer costs the full timeout every step.
-function waitForGrads(step, cohort, timeoutMs = 8000) {
+function waitFor(pred, timeoutMs) {              // resolves true if pred held, false on timeout
   return new Promise((resolve) => {
     const t0 = Date.now();
     let timer = null;
     const check = () => {
-      const live = cohort.filter(id => chans.has(id));   // prune departed peers
-      const got = incoming.get(step) || new Map();
-      const have = live.filter(id => got.has(id));
-      if (have.length === live.length || Date.now() - t0 > timeoutMs) {
+      const ok = pred();
+      if (ok || Date.now() - t0 > timeoutMs) {
         waiters.delete(check); clearInterval(timer);
-        resolve(have.map(id => got.get(id)));
+        resolve(!!ok);
       }
     };
     waiters.add(check);
     timer = setInterval(check, 500);                     // safety net only
     check();
   });
+}
+async function waitForGradIds(step, cohort, timeoutMs = 8000) {
+  await waitFor(() => {
+    const live = cohort.filter(id => chans.has(id));     // prune departed peers
+    const got = incoming.get(step) || new Map();
+    return live.every(id => got.has(id));
+  }, timeoutMs);
+  const got = incoming.get(step) || new Map();
+  return cohort.filter(id => chans.has(id) && got.has(id));
 }
 
 // ---- compute: one async training step THROUGH the verified units -----------
@@ -297,39 +468,116 @@ async function localStep() {
 async function train(cfg) {
   if (training) return; training = true; ui.start.disabled = true;
   cfgSliders().forEach(el => el.disabled = true);
+  incoming.clear(); rosters.clear(); peerHashes.clear();  // no stale grads from a previous run
+  const iLead = leaderId === null;                     // set by Start (null) or onConfig (starter's id)
   const cohort = [...chans.keys()];                    // lock the cohort (departed peers are pruned per-step)
   const steps = cfg.steps;
   const opt = TrainCore.makeAdam(model.nParams, { lr: cfg.lr });
   log(`training started — cohort ${cohort.length} peer(s), world ${cohort.length + 1}, ` +
-      `width=${cfg.c} seq=${cfg.t} batch=${cfg.b}×${cohort.length + 1}, optimizer ${opt.name}`);
+      `width=${cfg.c} seq=${cfg.t} batch=${cfg.b}×${cohort.length + 1}, optimizer ${opt.name}` +
+      (cohort.length ? `, sync ${iLead ? "led by me" : "led by " + nmeOf(leaderId)}` : "") +
+      ` · data: ${Transformer.datasetName()}` +
+      ` · grad payload ${(model.nParams * 4 / 1048576).toFixed(1)} MB/step/peer`);
+  if ((cfg.c > 64 || cfg.t > 64) && cohort.length + 1 < 4)
+    log(`⚠ large model (width ${cfg.c}, seq ${cfg.t}) with only ${cohort.length + 1} device(s) — ` +
+        `steps will be slow and the effective batch small. 4+ devices recommended at this size.`);
+  let halted = null;                                   // sync-guard stop reason
+  const contrib = new Map([[myId, 0]]);                // peerId -> grads contributed
+  for (const id of cohort) contrib.set(id, 0);
+  try {
   for (let s = 0; s < steps; s++) {
+    const whash = hashWeights();                       // pre-step fingerprint, sent with the grad
     const { loss, grad } = await localStep();
-    broadcastGrad(s, grad);
-    const remote = cohort.length ? await waitForGrads(s, cohort) : [];
-    const all = [grad, ...remote];
+    broadcastGrad(s, whash, loss, grad);
+    let all;
+    if (!cohort.length) {
+      all = [grad];                                    // solo run
+    } else if (iLead) {
+      const ids = await waitForGradIds(s, cohort);
+      // sync guard: publish the exact contributor set so every device
+      // averages the same gradients (or stops) — never a silent fork
+      broadcastRoster(s, [myId, ...ids]);
+      all = [grad, ...ids.map(id => incoming.get(s).get(id))];
+      rosters.set(s, [myId, ...ids]);
+    } else {
+      // follower: apply the leader's roster verbatim, or stop
+      await waitFor(() => rosters.has(s) || !chans.has(leaderId), 15000);
+      if (!rosters.has(s)) {
+        halted = chans.has(leaderId)
+          ? `no roster from ${nmeOf(leaderId)} for step ${s + 1}`
+          : `the sync leader (${nmeOf(leaderId)}) disconnected`;
+        break;
+      }
+      const roster = rosters.get(s);
+      const need = roster.filter(id => id !== myId);
+      const ok = await waitFor(() => need.every(id => (incoming.get(s) || new Map()).has(id)), 10000);
+      if (!ok) {
+        halted = `missing a roster gradient at step ${s + 1} — applying a partial average would fork the weights`;
+        break;
+      }
+      all = need.map(id => incoming.get(s).get(id));
+      if (roster.includes(myId)) all.unshift(grad);    // leader may have dropped my late grad — then I skip it too
+    }
+    // divergence check: every contributor's pre-step weight hash must match mine
+    const hs = peerHashes.get(s);
+    const roster = rosters.get(s) || [myId];
+    if (hs) {
+      const bad = roster.find(id => id !== myId && hs.has(id) && hs.get(id).hash !== whash);
+      if (bad) { halted = `weights diverged from ${nmeOf(bad)} (detected at step ${s + 1})`; break; }
+    }
+    // cluster-average loss over this step's actual contributors
+    let lossSum = 0, lossN = 0;
+    for (const id of roster) {
+      if (id === myId) { lossSum += loss; lossN++; contrib.set(myId, (contrib.get(myId) || 0) + 1); }
+      else if (hs && hs.has(id)) { lossSum += hs.get(id).loss; lossN++; contrib.set(id, (contrib.get(id) || 0) + 1); }
+    }
+    const clusterLoss = lossSum / Math.max(1, lossN);
     const avg = TrainCore.averageGrads(all);
     const upd = opt.step(avg);                      // DaisyAdam on the cluster-avg grad
     Transformer.applyUpdate(model, upd);            // W -= upd (lr folded into upd)
-    incoming.delete(s);
+    incoming.delete(s); rosters.delete(s); peerHashes.delete(s);
     trainedSteps++;
     if (s % 10 === 0 || s === steps - 1) {
-      ui.loss.textContent = loss.toFixed(5);
+      ui.loss.textContent = clusterLoss.toFixed(5);
       ui.step.textContent = `${s + 1} / ${steps}`;
       ui.bar.style.width = `${Math.round(100 * (s + 1) / steps)}%`;
       await new Promise(r => setTimeout(r, 0));         // yield to UI
     }
+    if (cohort.length && (s + 1) % 50 === 0)          // who is contributing what
+      log(`step ${s + 1}: contributions — ` +
+          [...contrib.entries()].map(([id, n]) => `${id === myId ? "me" : nmeOf(id)} ${n}/${s + 1}`).join(", "));
   }
-  log(`training done — final loss ${ui.loss.textContent}`);
-  try {
-    const sample = await Transformer.generate(model, "the ", 70);
-    ui.diff.textContent = `the model speaks: “${sample.trim()}”`;
-  } catch (e) {
-    ui.diff.textContent = "done — trained through the verified units; all peers share one model.";
+  } catch (e) {                                       // a device that errors REPORTS it
+    halted = `error during training: ${e.message}`;   // (instead of freezing at "—")
+    console.error(e);
   }
+  if (cohort.length)
+    log(`contribution totals — ` +
+        [...contrib.entries()].map(([id, n]) => `${id === myId ? "me" : nmeOf(id)} ${n} grad(s)`).join(", "));
+  if (halted) {
+    log(`SYNC GUARD: stopped — ${halted}. The model here is intact (${trainedSteps} steps); ` +
+        `to re-sync the group, load/push a checkpoint and start again.`);
+    ui.diff.textContent = "stopped by the sync guard — see log";
+  } else {
+    log(`training done — final loss ${ui.loss.textContent}`);
+    try {
+      const sample = await Transformer.generate(model, "the ", 70);
+      ui.diff.textContent = `the model speaks: “${sample.trim()}”`;
+    } catch (e) {
+      ui.diff.textContent = "done — trained through the verified units; all peers share one model.";
+    }
+  }
+  incoming.clear(); rosters.clear(); peerHashes.clear();
+  leaderId = null;
   training = false;
-  ui.save.disabled = false;
+  modelReady();
   ui.start.disabled = false;
   cfgSliders().forEach(el => el.disabled = false);
+}
+function modelReady() {                 // trained weights exist: enable save/kit/generate
+  ui.save.disabled = false;
+  ui.kit.disabled = false;
+  ui.genBtn.disabled = false;
 }
 function cfgSliders() { return [ui.cfgC, ui.cfgT, ui.cfgB, ui.cfgSteps, ui.cfgLr]; }
 
@@ -386,12 +634,25 @@ function buildModel(cfg) {
     ui.start.disabled = true;
     return;                                              // no signaling, no training
   }
-  ui.backend.textContent = `${compute.backend.toUpperCase()} — ${compute.label} · through verified INT8 units`;
+  ui.backend.textContent = `${compute.backend.toUpperCase()} — ${compute.label} · 3×INT8 fast-accurate through verified units`;
+  // tokenizer must load BEFORE the model is built (it sets the vocab size)
+  try {
+    const name = await Transformer.loadTokenizer();
+    ui.tokenizer.textContent = name;
+    log(`tokenizer: ${name}`);
+  } catch (e) {
+    ui.tokenizer.textContent = Transformer.tokenizerName();
+    log(`tokenizer.json unavailable (${e.message}) — using the ${Transformer.tokenizerName()} vocab`);
+  }
+  if (compute.backend === "cpu" && Transformer.vocabSize() > 1000)
+    log(`⚠ CPU backend with a ${Transformer.vocabSize()}-token vocab — steps will take seconds; ` +
+        `a WebGPU-capable browser will be much faster`);
   // slider readouts
   for (const [el, v] of [[ui.cfgC, "vcfgC"], [ui.cfgT, "vcfgT"], [ui.cfgB, "vcfgB"],
                          [ui.cfgSteps, "vcfgSteps"], [ui.cfgLr, "vcfgLr"]])
     el.oninput = () => document.getElementById(v).textContent = el.value;
   buildModel(readCfgFromUI());
+  ui.start.disabled = false;                             // solo training works too
   ui.me.textContent = deviceName;
   if (room()) {
     ui.roomInfo.style.display = "";
@@ -404,13 +665,32 @@ function buildModel(cfg) {
   }
   updatePeers();
   connectSignaling();
+  // dataset: stream FineWeb-Edu from HuggingFace; built-in corpus if offline
+  ui.dataset.textContent = "streaming FineWeb-Edu…";
+  Transformer.streamFineWebEdu().then(({ name, chars }) => {
+    ui.dataset.textContent = "FineWeb-Edu (streamed)";
+    log(`dataset: ${name} — ${(chars / 1000).toFixed(0)}k chars loaded (each device streams its own slice)`);
+  }).catch((e) => {
+    ui.dataset.textContent = "built-in corpus (offline)";
+    log(`dataset: FineWeb-Edu stream unavailable (${e.message}) — using the built-in corpus`);
+  });
   ui.start.onclick = () => {
     const cfg = readCfgFromUI();
+    leaderId = null;                                     // I pressed Start: I lead sync
     buildModel(cfg);
     broadcastConfig(cfg);                                // everyone follows these settings
     train(cfg);
   };
   ui.save.onclick = saveCheckpoint;
+  ui.kit.onclick = downloadInferenceKit;
+  ui.genBtn.onclick = async () => {
+    if (training) { log("can't generate mid-training"); return; }
+    ui.genBtn.disabled = true;
+    ui.genOut.textContent = "generating…";
+    try { ui.genOut.textContent = await Transformer.generate(model, ui.genPrompt.value || "the ", 150); }
+    catch (e) { ui.genOut.textContent = `error: ${e.message}`; }
+    ui.genBtn.disabled = false;
+  };
   ui.loadBtn.onclick = () => { if (training) { log("can't load a checkpoint mid-training"); return; } ui.load.click(); };
   ui.load.onchange = async () => {
     const f = ui.load.files[0]; ui.load.value = "";

@@ -28,29 +28,96 @@
       s += `the ${pick(W_ADJ)} ${pick(W_NOUN)} ${pick(W_VERB)} ${pick(W_PREP)} the ${pick(W_ADJ)} ${pick(W_NOUN)}. `;
     return s;
   }
-  const CORPUS = buildCorpus();
-  const CHARS = [...new Set(CORPUS)].sort();
-  const VOCAB = CHARS.length;
-  const STOI = Object.fromEntries(CHARS.map((c, i) => [c, i]));
-  const IDS = new Int32Array(CORPUS.length);
-  for (let i = 0; i < CORPUS.length; i++) IDS[i] = STOI[CORPUS[i]];
+  // ---- tokenizer -------------------------------------------------------------
+  // Spikewhale tokenizer (tokenizer.json): byte-level greedy longest-match
+  // ("length-max"), ~16.5k tokens. Until it loads (or if the file is missing)
+  // a 96-char byte-level vocab keeps the app working — but ALL devices in a
+  // group must use the same tokenizer (the config broadcast enforces it).
+  const FALLBACK_CHARS = [...Array(95)].map((_, i) => String.fromCharCode(32 + i)).concat(["\n"]);
+  let tok = {
+    name: "char-96 (fallback)",
+    vocab: Object.fromEntries(FALLBACK_CHARS.map((c, i) => [c, i])),
+    ids: FALLBACK_CHARS, maxLen: 1, size: FALLBACK_CHARS.length,
+    unk: 0, specials: new Set(),
+  };
+  tok.unk = tok.vocab[" "];
+  function vocabSize() { return tok.size; }
+  function tokenizerName() { return tok.name; }
+  function loadTokenizerData(d) {              // plain {vocab, vocab_size, max_token_len}
+    const ids = new Array(d.vocab_size);
+    for (const [t, i] of Object.entries(d.vocab)) ids[i] = t;
+    tok = { name: `Spikewhale length-max (${d.vocab_size} tokens)`,
+            vocab: d.vocab, ids, maxLen: d.max_token_len || 24, size: d.vocab_size,
+            unk: d.vocab["<unk>"] ?? 1,
+            specials: new Set(["<pad>", "<unk>", "<bos>", "<eos>", ...(d.special_tokens || [])]) };
+    IDS = encode(CORPUS);                      // re-tokenize whatever corpus is loaded
+    return tok.name;
+  }
+  async function loadTokenizer(url) {
+    const r = await fetch(url || "tokenizer.json");
+    if (!r.ok) throw new Error(`tokenizer.json HTTP ${r.status}`);
+    return loadTokenizerData(await r.json());
+  }
+  function toLatin1(s) { const b = new TextEncoder().encode(s); let o = ""; for (const x of b) o += String.fromCharCode(x); return o; }
+  function encode(text) {                      // greedy longest match over bytes
+    const s = toLatin1(text), out = [];
+    let i = 0;
+    while (i < s.length) {
+      let m = null;
+      for (let L = Math.min(tok.maxLen, s.length - i); L > 0; L--) {
+        const sub = s.substr(i, L);
+        if (sub in tok.vocab) { m = sub; break; }
+      }
+      if (m === null) { out.push(tok.unk); i++; continue; }
+      out.push(tok.vocab[m]); i += m.length;
+    }
+    return Int32Array.from(out);
+  }
+  function decode(idArr) {
+    let s = "";
+    for (const id of idArr) {
+      const t = tok.ids[id];
+      if (t === undefined || tok.specials.has(t)) continue;
+      s += t;
+    }
+    const bytes = Uint8Array.from([...s].map(c => c.charCodeAt(0)));
+    return new TextDecoder().decode(bytes);
+  }
+  let CORPUS = buildCorpus();
+  let IDS = encode(CORPUS);
+  let DATASET = "built-in corpus";
+
+  // Stream real training text: FineWeb-Edu, via the public HuggingFace
+  // datasets-server rows API. Each device pulls its own random slice (that's
+  // data parallelism — batches were always per-device anyway). Offline or on
+  // API failure the built-in corpus stays in place.
+  async function streamFineWebEdu() {
+    const offset = Math.floor(Math.random() * 9900);
+    const url = "https://datasets-server.huggingface.co/rows?dataset=HuggingFaceFW%2Ffineweb-edu" +
+                `&config=default&split=train&offset=${offset}&length=100`;
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`datasets-server HTTP ${r.status}`);
+    const j = await r.json();
+    const text = j.rows.map(x => x.row.text).join("\n").replace(/[^\x20-\x7e\n]/g, " ");
+    if (text.length < 10000) throw new Error("too little text returned");
+    CORPUS = text.slice(0, 500000);
+    IDS = encode(CORPUS);
+    DATASET = "FineWeb-Edu (streamed from HuggingFace)";
+    return { name: DATASET, chars: CORPUS.length };
+  }
+  function datasetName() { return DATASET; }
 
   // ---- verified matmul: float in -> quantize -> LUT multiply -> dequant -----
   // weights/projections may go through WebGPU; attention (per-head, many small
   // matmuls) uses the CPU LUT path — same verified units, no dispatch overhead.
+  // 3xINT8 fast-accurate GEMM (CUTLASS 3xTF32 scheme through the verified
+  // units): three exact LUT GEMMs recover ~14-bit precision from the 8-bit
+  // units — see Verified.lutMatmul3.
   async function vmm(Xf, Wf, m, k, n, ctx) {
-    const xq = V.quantize(Xf), wq = V.quantize(Wf);
-    const acc = await ctx.matmulInt8(xq.q, wq.q, m, k, n, ctx.L);
-    const dq = xq.scale * wq.scale, out = new Float32Array(m * n);
-    for (let i = 0; i < out.length; i++) out[i] = acc[i] * dq;
-    return out;
+    return V.lutMatmul3(Xf, Wf, m, k, n, ctx.L, ctx.matmulInt8);
   }
   function vmmCPU(Xf, Wf, m, k, n, ctx) {
-    const xq = V.quantize(Xf), wq = V.quantize(Wf);
-    const acc = V.lutMatmulJS(xq.q, wq.q, m, k, n, ctx.L);
-    const dq = xq.scale * wq.scale, out = new Float32Array(m * n);
-    for (let i = 0; i < out.length; i++) out[i] = acc[i] * dq;
-    return out;
+    return V.lutMatmul3JS(Xf, Wf, m, k, n, ctx.L);
   }
 
   // ---- layernorm (no affine) -------------------------------------------------
@@ -84,9 +151,9 @@
     const params = [], names = [];
     const add = (name, w) => { params.push(w); names.push(name); return w; };
     const m = {
-      cfg: { ...cfg, layers, heads, hidden, vocab: VOCAB },
+      cfg: { ...cfg, layers, heads, hidden, vocab: vocabSize() },
       ctx: { L, matmulInt8 },
-      emb: add("emb", mk(VOCAB * c, 0.08)),
+      emb: add("emb", mk(vocabSize() * c, 0.08)),
       pos: add("pos", mk(cfg.t * c, 0.02)),
       blocks: [], params, names,
     };
@@ -96,7 +163,7 @@
         Wv: add(`b${l}.Wv`, mk(c * c, 0.08)), Wo: add(`b${l}.Wo`, mk(c * c, 0.08)),
         W1: add(`b${l}.W1`, mk(c * hidden, 0.08)), W2: add(`b${l}.W2`, mk(hidden * c, 0.08)),
       });
-    m.Wu = add("Wu", mk(c * VOCAB, 0.08));
+    m.Wu = add("Wu", mk(c * vocabSize(), 0.08));
     m.nParams = params.reduce((a, p) => a + p.length, 0);
     return m;
   }
@@ -289,7 +356,7 @@
   // greedy sampling — watch the model actually speak
   async function generate(m, prompt, nChars) {
     const { t: T } = m.cfg;
-    let ids = [...prompt].map(ch => STOI[ch] ?? 0);
+    let ids = [...encode(prompt)];
     for (let step = 0; step < nChars; step++) {
       const win = ids.slice(-T);
       const X = new Int32Array(T), Y = new Int32Array(T);
@@ -302,10 +369,12 @@
       for (let j = 0; j < m.cfg.vocab; j++) if (logits[row + j] > bv) { bv = logits[row + j]; best = j; }
       ids.push(best);
     }
-    return ids.map(i => CHARS[i]).join("");
+    return decode(ids);
   }
 
-  const api = { init, trainStep, applyUpdate, getFlatParams, setFlatParams, generate, VOCAB, CORPUS };
+  const api = { init, trainStep, applyUpdate, getFlatParams, setFlatParams, generate,
+                streamFineWebEdu, datasetName, loadTokenizer, loadTokenizerData,
+                vocabSize, tokenizerName, encode, decode };
   if (typeof module !== "undefined" && module.exports) { TC = require("./traincore.js"); V = require("./verified_core.js"); module.exports = api; }
   else { TC = root.TrainCore; V = root.Verified; root.Transformer = api; }
 })(typeof self !== "undefined" ? self : this);

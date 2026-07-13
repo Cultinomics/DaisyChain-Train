@@ -20,7 +20,7 @@ const cfg = { c: 32, t: 32, b: 8, layers: 2, heads: 2, steps: 120, lr: 0.02 };
 (async function () {
   const A = X.init(cfg, L, matmulInt8);
   const B = X.init(cfg, L, matmulInt8);
-  console.log(`vocab=${X.VOCAB}, params=${A.nParams}, baseline loss=${Math.log(X.VOCAB).toFixed(3)}`);
+  console.log(`vocab=${X.vocabSize()}, params=${A.nParams}, baseline loss=${Math.log(X.vocabSize()).toFixed(3)}`);
   const oa = T.makeAdam(A.nParams, { lr: cfg.lr });
   const ob = T.makeAdam(B.nParams, { lr: cfg.lr });
   let first = 0, loss = 0;
@@ -40,7 +40,7 @@ const cfg = { c: 32, t: 32, b: 8, layers: 2, heads: 2, steps: 120, lr: 0.02 };
   const sample = await X.generate(A, "the ", 60);
   console.log(`sample: "${sample}"`);
   console.log(`replica max param diff: ${diff.toExponential(3)}`);
-  const ok = loss < first * 0.75 && loss < Math.log(X.VOCAB) && diff === 0;
+  const ok = loss < first * 0.75 && loss < Math.log(X.vocabSize()) && diff === 0;
   console.log(ok ? "TRANSFORMER TEST PASSED" : "TRANSFORMER TEST FAILED");
   process.exit(ok ? 0 : 1);
 })();

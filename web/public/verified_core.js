@@ -28,6 +28,44 @@
     return C;
   }
 
+  // ---- 3xINT8 fast-accurate GEMM --------------------------------------------
+  // The CUTLASS example-27 "3xTF32" scheme, ported to the verified units:
+  // split each float into a coarse int8 part plus an int8-quantized residual,
+  // run three EXACT LUT GEMMs (hi·hi, hi·lo, lo·hi), drop the negligible
+  // lo·lo, and recombine. Same big/small decomposition NVIDIA uses to recover
+  // near-fp32 accuracy from TF32 tensor cores — here it recovers ~14-bit
+  // accuracy from the 8-bit units, at 3× the unit ops. Every product still
+  // goes through the verified mul8 LUT.
+  function quantize2(X) {
+    const hi = quantize(X);
+    const r = new Float32Array(X.length);
+    for (let i = 0; i < X.length; i++) r[i] = X[i] - hi.q[i] * hi.scale;
+    const lo = quantize(r);
+    return { hi, lo };
+  }
+  function combine3(hh, hl, lh, x, w, len) {
+    const out = new Float32Array(len);
+    const shh = x.hi.scale * w.hi.scale, shl = x.hi.scale * w.lo.scale, slh = x.lo.scale * w.hi.scale;
+    for (let i = 0; i < len; i++) out[i] = hh[i] * shh + hl[i] * shl + lh[i] * slh;
+    return out;
+  }
+  function lutMatmul3JS(Xf, Wf, m, k, n, L) {          // sync, CPU LUT path
+    const x = quantize2(Xf), w = quantize2(Wf);
+    return combine3(lutMatmulJS(x.hi.q, w.hi.q, m, k, n, L),
+                    lutMatmulJS(x.hi.q, w.lo.q, m, k, n, L),
+                    lutMatmulJS(x.lo.q, w.hi.q, m, k, n, L), x, w, m * n);
+  }
+  async function lutMatmul3(Xf, Wf, m, k, n, L, matmulInt8) {  // any backend
+    const x = quantize2(Xf), w = quantize2(Wf);
+    const mm = matmulInt8 || lutMatmulJS;
+    const [hh, hl, lh] = await Promise.all([
+      mm(x.hi.q, w.hi.q, m, k, n, L),
+      mm(x.hi.q, w.lo.q, m, k, n, L),
+      mm(x.lo.q, w.hi.q, m, k, n, L),
+    ]);
+    return combine3(hh, hl, lh, x, w, m * n);
+  }
+
   // one verified layer forward; returns float out (+ cache for STE backward).
   // Every product goes through the verified INT8 multiply (mul8 LUT) with exact
   // int32 accumulation — i.e. an emulated INT8 tensor-core GEMM — then dequant.
@@ -78,7 +116,7 @@
     for (let j = 0; j < W2.length; j++) W2[j] -= lr * gAvg[W1.length + j];
   }
 
-  const api = { quantize, lutMatmulJS, linearFwd, forward, backward, splitApply };
+  const api = { quantize, quantize2, lutMatmulJS, lutMatmul3JS, lutMatmul3, linearFwd, forward, backward, splitApply };
   if (typeof module !== "undefined" && module.exports) { TC = require("./traincore.js"); module.exports = api; }
   else { TC = root.TrainCore; root.Verified = api; }
 })(typeof self !== "undefined" ? self : this);
