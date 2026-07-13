@@ -4,7 +4,15 @@
 
 // model + task now live in transformer.js — a mini transformer LM trained
 // through the verified INT8 units. Settings come from the sliders.
-const STUN = [{ urls: "stun:stun.l.google.com:19302" }];
+// STUN discovers the direct path; the TURN relays (Open Relay, free) carry the
+// traffic when both sides sit behind symmetric NATs (mobile carriers, corp
+// networks) — without TURN those users can never connect across networks.
+const STUN = [
+  { urls: "stun:stun.l.google.com:19302" },
+  { urls: "turn:openrelay.metered.ca:80", username: "openrelayproject", credential: "openrelayproject" },
+  { urls: "turn:openrelay.metered.ca:443", username: "openrelayproject", credential: "openrelayproject" },
+  { urls: "turns:openrelay.metered.ca:443?transport=tcp", username: "openrelayproject", credential: "openrelayproject" },
+];
 
 const ui = {
   status: document.getElementById("status"),
@@ -155,17 +163,30 @@ function initiatePeer(peerId) {
   setupChannel(peerId, dc);
   pc.createOffer().then(o => pc.setLocalDescription(o)).then(() => signal(peerId, { sdp: pc.localDescription }));
 }
+// ICE candidates can arrive while setRemoteDescription is still awaiting (the
+// async handlers interleave) — adding one before the description is set throws
+// and the candidate is lost, so the connection silently fails. Queue them and
+// flush once the remote description lands.
+const pendingCand = new Map();                 // peerId -> [candidate,...]
 async function onSignal(from, data) {
   let pc = pcs.get(from);
   if (data.sdp) {
     if (!pc) { pc = newPC(from); pc.ondatachannel = (e) => setupChannel(from, e.channel); }
     await pc.setRemoteDescription(data.sdp);
+    for (const c of pendingCand.get(from) || [])
+      try { await pc.addIceCandidate(c); } catch (e) {}
+    pendingCand.delete(from);
     if (data.sdp.type === "offer") {
       const ans = await pc.createAnswer(); await pc.setLocalDescription(ans);
       signal(from, { sdp: pc.localDescription });
     }
-  } else if (data.candidate && pc) {
-    try { await pc.addIceCandidate(data.candidate); } catch (e) {}
+  } else if (data.candidate) {
+    if (pc && pc.remoteDescription) {
+      try { await pc.addIceCandidate(data.candidate); } catch (e) {}
+    } else {                                   // pc missing or not ready: hold it
+      if (!pendingCand.has(from)) pendingCand.set(from, []);
+      pendingCand.get(from).push(data.candidate);
+    }
   }
 }
 function setupChannel(peerId, dc) {
@@ -174,7 +195,7 @@ function setupChannel(peerId, dc) {
   dc.onclose = () => { chans.delete(peerId); updatePeers(); wake(); };
   dc.onmessage = (e) => onGrad(peerId, e.data);
 }
-function cleanupPeer(id) { const pc = pcs.get(id); if (pc) pc.close(); pcs.delete(id); chans.delete(id); wake(); }
+function cleanupPeer(id) { const pc = pcs.get(id); if (pc) pc.close(); pcs.delete(id); chans.delete(id); pendingCand.delete(id); wake(); }
 
 // ---- checkpoints ------------------------------------------------------------
 // File layout (also the broadcast payload after the sentinel):
@@ -337,13 +358,30 @@ function onConfig(peerId, buf) {
 //   [int32 -5][int32 msgId][int32 seq][int32 total][bytes...]
 // Channels are ordered+reliable, so chunks arrive in order per peer.
 const FRAG_SENTINEL = -5, FRAG_CHUNK = 48 * 1024;
+const DC_MAXBUF = 4 * 1024 * 1024;               // pause sending above this backlog
 let fragSeq = 1;
 const fragIn = new Map();                        // peerId -> {id, parts, got, total}
-function dcSend(dc, buf) {
-  if (buf.byteLength <= FRAG_CHUNK) { dc.send(buf); return; }
+function dcDrain(dc) {                           // wait for the send buffer to empty out
+  return new Promise((res) => {
+    if (dc.bufferedAmount <= DC_MAXBUF || dc.readyState !== "open") return res();
+    const t = setInterval(() => {
+      if (dc.bufferedAmount <= DC_MAXBUF || dc.readyState !== "open") { clearInterval(t); res(); }
+    }, 50);
+  });
+}
+async function dcSend(dc, buf) {
+  // multi-MB gradients can overflow the channel's send buffer, which makes
+  // dc.send throw and kills the training loop — so apply backpressure
+  if (buf.byteLength <= FRAG_CHUNK) {
+    await dcDrain(dc);
+    if (dc.readyState === "open") dc.send(buf);
+    return;
+  }
   const id = fragSeq++, src = new Uint8Array(buf);
   const total = Math.ceil(src.length / FRAG_CHUNK);
   for (let s = 0; s < total; s++) {
+    await dcDrain(dc);
+    if (dc.readyState !== "open") return;        // peer left mid-send
     const part = src.subarray(s * FRAG_CHUNK, Math.min((s + 1) * FRAG_CHUNK, src.length));
     const msg = new ArrayBuffer(16 + part.length);
     new Int32Array(msg, 0, 4).set([FRAG_SENTINEL, id, s, total]);
@@ -351,7 +389,7 @@ function dcSend(dc, buf) {
     dc.send(msg);
   }
 }
-function broadcast(buf) { for (const dc of chans.values()) if (dc.readyState === "open") dcSend(dc, buf); }
+async function broadcast(buf) { for (const dc of chans.values()) if (dc.readyState === "open") await dcSend(dc, buf); }
 function onFragment(peerId, buf) {               // returns full message when complete
   const [, id, seq, total] = new Int32Array(buf, 0, 4);
   let st = fragIn.get(peerId);
@@ -427,7 +465,7 @@ function onGrad(peerId, buf) {
   peerHashes.get(step).set(peerId, { hash: whash, loss });
   wake();                                        // resolve waits immediately (no polling)
 }
-function broadcastGrad(step, whash, loss, grad) { broadcast(packGrad(step, whash, loss, grad)); }
+function broadcastGrad(step, whash, loss, grad) { return broadcast(packGrad(step, whash, loss, grad)); }
 // Event-driven: re-checked on every gradient arrival and peer departure, plus a
 // coarse fallback timer (background tabs throttle timers to ~1s, so the old
 // 15ms poll was the bottleneck there). Peers that left are dropped from the
@@ -488,7 +526,7 @@ async function train(cfg) {
   for (let s = 0; s < steps; s++) {
     const whash = hashWeights();                       // pre-step fingerprint, sent with the grad
     const { loss, grad } = await localStep();
-    broadcastGrad(s, whash, loss, grad);
+    await broadcastGrad(s, whash, loss, grad);
     let all;
     if (!cohort.length) {
       all = [grad];                                    // solo run
@@ -496,9 +534,14 @@ async function train(cfg) {
       const ids = await waitForGradIds(s, cohort);
       // sync guard: publish the exact contributor set so every device
       // averages the same gradients (or stops) — never a silent fork
-      broadcastRoster(s, [myId, ...ids]);
-      all = [grad, ...ids.map(id => incoming.get(s).get(id))];
-      rosters.set(s, [myId, ...ids]);
+      const roster = [myId, ...ids];
+      broadcastRoster(s, roster);
+      rosters.set(s, roster);
+      // CRITICAL: average strictly in roster order. Float addition is
+      // commutative but NOT associative — if any device sums in a different
+      // order (e.g. self-first), 3+ devices each get a microscopically
+      // different average and the weights fork. Roster order is the canon.
+      all = roster.map(id => id === myId ? grad : incoming.get(s).get(id));
     } else {
       // follower: apply the leader's roster verbatim, or stop
       await waitFor(() => rosters.has(s) || !chans.has(leaderId), 15000);
@@ -515,8 +558,9 @@ async function train(cfg) {
         halted = `missing a roster gradient at step ${s + 1} — applying a partial average would fork the weights`;
         break;
       }
-      all = need.map(id => incoming.get(s).get(id));
-      if (roster.includes(myId)) all.unshift(grad);    // leader may have dropped my late grad — then I skip it too
+      // same canonical order as the leader (self's grad in its roster slot);
+      // if the leader dropped my late grad from the roster, I skip it too
+      all = roster.map(id => id === myId ? grad : incoming.get(s).get(id)).filter(Boolean);
     }
     // divergence check: every contributor's pre-step weight hash must match mine
     const hs = peerHashes.get(s);

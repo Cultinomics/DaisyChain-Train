@@ -51,6 +51,9 @@
   }
 
   // average a list of gradient Float32Arrays (equal weight)
+  // ORDER MATTERS: float addition is not associative, so every replica MUST
+  // pass the gradients in the same order (the leader's roster order) or their
+  // averages differ in the last bits and the weights fork. Never self-first.
   function averageGrads(grads) {
     const out = new Float32Array(grads[0].length);
     for (const g of grads) for (let i = 0; i < g.length; i++) out[i] += g[i];
