@@ -147,6 +147,71 @@
     return bgemmJS(x.q, wq, x.s, ws, d, L);
   }
 
+  // ---- gather-fused attention through the units (CUTLASS ex. 36/52) ----------
+  // The kernels read q/k/v/ctx directly in their natural BT×C layout with
+  // head-strided indexing — no JS gather copies, no kᵀ transpose, and the
+  // context write scatters straight back into BT×C. Quantization stays
+  // block-scaled: q/k/a per (token,head) row, v per (head,channel) column.
+  // The (BT·heads)×hd row view of q/k IS the contiguous buffer, so
+  // quantizeRows(q, BT·heads, hd) gives per-(token,head) scales for free.
+  function quantizeHeadCols(v, B, T, heads, hd) {   // per (batch,head,channel) column
+    const C = heads * hd;
+    const q = new Int8Array(B * T * C), s = new Float32Array(B * heads * hd);
+    for (let bi = 0; bi < B; bi++)
+      for (let h = 0; h < heads; h++)
+        for (let j = 0; j < hd; j++) {
+          let mx = 0;
+          for (let ti = 0; ti < T; ti++) {
+            const a = Math.abs(v[(bi * T + ti) * C + h * hd + j]);
+            if (a > mx) mx = a;
+          }
+          const sc = Math.max(mx / 127, 1e-8);
+          s[(bi * heads + h) * hd + j] = sc;
+          for (let ti = 0; ti < T; ti++) {
+            const idx = (bi * T + ti) * C + h * hd + j;
+            const w = Math.round(v[idx] / sc);
+            q[idx] = w < -128 ? -128 : w > 127 ? 127 : w;
+          }
+        }
+    return { q, s };
+  }
+  // scores S[bz,ti,tj] = q_row(bi,ti,h) · k_row(bi,tj,h), every product via the LUT
+  function attScoresJS(qq, kq, qs, ks, d, L) {
+    const { B, T, heads, hd } = d, C = heads * hd, mul = L.mul;
+    const out = new Float32Array(B * heads * T * T);
+    for (let bi = 0; bi < B; bi++) for (let h = 0; h < heads; h++) {
+      const bz = bi * heads + h;
+      for (let ti = 0; ti < T; ti++) {
+        const qo = (bi * T + ti) * C + h * hd, rscale = qs[(bi * T + ti) * heads + h];
+        for (let tj = 0; tj < T; tj++) {
+          const ko = (bi * T + tj) * C + h * hd;
+          let acc = 0;
+          for (let p = 0; p < hd; p++) acc += mul[(qq[qo + p] & 0xFF) * 256 + (kq[ko + p] & 0xFF)];
+          out[(bz * T + ti) * T + tj] = acc * rscale * ks[(bi * T + tj) * heads + h];
+        }
+      }
+    }
+    return out;
+  }
+  // ctx[(bi,ti),(h,j)] = Σ_tj a[bz,ti,tj]·v[(bi,tj),(h,j)] — scatter fused into BT×C
+  function attCtxJS(aq, vq, as, vs, d, L) {
+    const { B, T, heads, hd } = d, C = heads * hd, mul = L.mul;
+    const out = new Float32Array(B * T * C);
+    for (let bi = 0; bi < B; bi++) for (let h = 0; h < heads; h++) {
+      const bz = bi * heads + h;
+      for (let ti = 0; ti < T; ti++) {
+        const ao = (bz * T + ti) * T, rscale = as[bz * T + ti];
+        for (let j = 0; j < hd; j++) {
+          let acc = 0;
+          for (let tj = 0; tj < T; tj++)
+            acc += mul[(aq[ao + tj] & 0xFF) * 256 + (vq[(bi * T + tj) * C + h * hd + j] & 0xFF)];
+          out[(bi * T + ti) * C + h * hd + j] = acc * rscale * vs[(bi * heads + h) * hd + j];
+        }
+      }
+    }
+    return out;
+  }
+
   // one verified layer forward; returns float out (+ cache for STE backward).
   // Every product goes through the verified INT8 multiply (mul8 LUT) with exact
   // int32 accumulation — i.e. an emulated INT8 tensor-core GEMM — then dequant.
@@ -197,8 +262,8 @@
     for (let j = 0; j < W2.length; j++) W2[j] -= lr * gAvg[W1.length + j];
   }
 
-  const api = { quantize, quantize2, quantizeRows, quantizeCols, lutMatmulJS, lutMatmul3JS, lutMatmul3,
-                bgemmJS, vgemmBlock, linearFwd, forward, backward, splitApply };
+  const api = { quantize, quantize2, quantizeRows, quantizeCols, quantizeHeadCols, lutMatmulJS, lutMatmul3JS, lutMatmul3,
+                bgemmJS, vgemmBlock, attScoresJS, attCtxJS, linearFwd, forward, backward, splitApply };
   if (typeof module !== "undefined" && module.exports) { TC = require("./traincore.js"); module.exports = api; }
   else { TC = root.TrainCore; root.Verified = api; }
 })(typeof self !== "undefined" ? self : this);

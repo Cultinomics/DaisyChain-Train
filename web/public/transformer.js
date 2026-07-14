@@ -119,10 +119,6 @@
   async function vmm(Xf, Wf, m, k, n, ctx, relu) {
     return V.vgemmBlock(Xf, Wf, { m, k, n, batch: 1, relu: !!relu }, ctx.L, ctx.bgemm);
   }
-  // batched: one dispatch for all B×H attention-head problems (ex. 05/24)
-  async function vmmBatched(Xf, Wf, m, k, n, batch, ctx) {
-    return V.vgemmBlock(Xf, Wf, { m, k, n, batch }, ctx.L, ctx.bgemm);
-  }
 
   // ---- layernorm (no affine) -------------------------------------------------
   function lnFwd(x, rows, C) {
@@ -158,7 +154,8 @@
     const add = (name, w) => { params.push(w); names.push(name); return w; };
     const m = {
       cfg: { ...cfg, layers, heads, hidden, vocab: vocabSize() },
-      ctx: { L, bgemm: (engine && engine.bgemm) || null },
+      ctx: { L, bgemm: (engine && engine.bgemm) || null,
+             att: (engine && engine.att) || null, fgemm: (engine && engine.fgemm) || null },
       emb: add("emb", mk(vocabSize() * c, 0.08)),
       pos: add("pos", mk(cfg.t * c, 0.02)),
       blocks: [], params, names,
@@ -218,26 +215,16 @@
       const k = await vmm(l1.y, bl.Wk, BT, C, C, ctx);
       const v = await vmm(l1.y, bl.Wv, BT, C, C, ctx);
       cb.q = q; cb.k = k; cb.v = v;
-      const ctxOut = new Float32Array(BT * C);
-      cb.att = [];                                     // per (b,h): softmax probs
       const scale = 1 / Math.sqrt(hd);
-      // gather every head into batched contiguous layouts, then run ALL B×H
-      // score GEMMs in ONE batched dispatch (and all attn·V in another) —
-      // instead of 2·B·H tiny sequential matmuls
-      const BH = B * heads;
-      const qb = new Float32Array(BH * T * hd), kb = new Float32Array(BH * T * hd);
-      const vb = new Float32Array(BH * T * hd), ktb = new Float32Array(BH * hd * T);
-      for (let bi = 0; bi < B; bi++) for (let h = 0; h < heads; h++) {
-        const bz = bi * heads + h;
-        for (let ti = 0; ti < T; ti++) for (let j = 0; j < hd; j++) {
-          const src = (bi * T + ti) * C + h * hd + j;
-          qb[(bz * T + ti) * hd + j] = q[src];
-          kb[(bz * T + ti) * hd + j] = k[src];
-          vb[(bz * T + ti) * hd + j] = v[src];
-          ktb[(bz * hd + j) * T + ti] = k[src];        // kᵀ per head, for scores
-        }
-      }
-      const sAll = await vmmBatched(qb, ktb, T, hd, T, BH, ctx);   // scores through the units
+      // gather-FUSED attention (CUTLASS ex. 36/52): the kernels read q/k/v in
+      // their natural BT×C layout with head-strided indexing and scatter ctx
+      // straight back — no JS gather copies, no kᵀ transpose. All B×H heads in
+      // one dispatch per stage, every product through the verified units.
+      const BH = B * heads, dAtt = { B, T, heads, hd };
+      // per-(token,head) row quantization: the (BT·heads)×hd view IS the buffer
+      const qq = V.quantizeRows(q, BT * heads, hd), kq = V.quantizeRows(k, BT * heads, hd);
+      const sAll = ctx.att ? await ctx.att.scores(qq.q, kq.q, qq.s, kq.s, dAtt)
+                           : V.attScoresJS(qq.q, kq.q, qq.s, kq.s, dAtt, ctx.L);
       const aAll = new Float32Array(BH * T * T);                   // causal softmax
       for (let bz = 0; bz < BH; bz++) {
         const so = bz * T * T;
@@ -249,16 +236,11 @@
           for (let tj = 0; tj <= ti; tj++) aAll[so + ti * T + tj] /= z;
         }
       }
-      const cAll = await vmmBatched(aAll, vb, T, T, hd, BH, ctx);  // attn·V through the units
-      for (let bi = 0; bi < B; bi++) for (let h = 0; h < heads; h++) {
-        const bz = bi * heads + h;
-        for (let ti = 0; ti < T; ti++) for (let j = 0; j < hd; j++)
-          ctxOut[(bi * T + ti) * C + h * hd + j] = cAll[(bz * T + ti) * hd + j];
-        cb.att.push({ a: aAll.subarray(bz * T * T, (bz + 1) * T * T),
-                      qh: qb.subarray(bz * T * hd, (bz + 1) * T * hd),
-                      kh: kb.subarray(bz * T * hd, (bz + 1) * T * hd),
-                      vh: vb.subarray(bz * T * hd, (bz + 1) * T * hd) });
-      }
+      const aq = V.quantizeRows(aAll, BH * T, T);
+      const vq = V.quantizeHeadCols(v, B, T, heads, hd);
+      const ctxOut = ctx.att ? await ctx.att.ctx(aq.q, vq.q, aq.s, vq.s, dAtt)
+                             : V.attCtxJS(aq.q, vq.q, aq.s, vq.s, dAtt, ctx.L);
+      cb.aAll = aAll;                                  // backward slices heads from q/k/v/aAll
       cb.ctxOut = ctxOut;
       const attnOut = await vmm(ctxOut, bl.Wo, BT, C, C, ctx);
       const x2 = new Float32Array(BT * C);
@@ -295,15 +277,26 @@
   }
 
   // ---- STE backward (float), mirrors forward exactly --------------------------
-  function backward(m, cache) {
+  // The two vocab-sized matmuls run on the split-K f32 GPU kernel when
+  // available (CUTLASS ex. 06) — same float math, off the JS thread.
+  async function backward(m, cache) {
     const { c: C, t: T, b: B, layers, heads, hidden, vocab } = m.cfg;
     const BT = B * T, hd = C / heads, mm = TC.matmul, tr = TC.transpose;
     const g = m.params.map(p => new Float32Array(p.length));
     const gi = Object.fromEntries(m.names.map((n, i) => [n, i]));
     // tied unembed: logits = lnf @ embᵀ, so the unembedding gradient flows
     // straight into emb — dlogitsᵀ @ lnf is V×C, emb's own shape
-    g[gi.emb] = mm(tr(cache.dlogits, BT, vocab), cache.lnf.y, vocab, BT, C);
-    let dx = lnBwd(mm(cache.dlogits, m.emb, BT, vocab, C), cache.lnf.y, cache.lnf.sig, BT, C);
+    let dlnfIn;
+    if (m.ctx.fgemm) {
+      [g[gi.emb], dlnfIn] = await Promise.all([
+        m.ctx.fgemm(cache.dlogits, cache.lnf.y, { m: vocab, k: BT, n: C, transA: true }),
+        m.ctx.fgemm(cache.dlogits, m.emb, { m: BT, k: vocab, n: C }),      // split-K shape
+      ]);
+    } else {
+      g[gi.emb] = mm(tr(cache.dlogits, BT, vocab), cache.lnf.y, vocab, BT, C);
+      dlnfIn = mm(cache.dlogits, m.emb, BT, vocab, C);
+    }
+    let dx = lnBwd(dlnfIn, cache.lnf.y, cache.lnf.sig, BT, C);
     const scale = 1 / Math.sqrt(hd);
     for (let l = layers - 1; l >= 0; l--) {
       const bl = m.blocks[l], cb = cache.blocks[l];
@@ -320,9 +313,12 @@
       g[gi[`b${l}.Wo`]] = mm(tr(cb.ctxOut, BT, C), dx2, C, BT, C);
       const dctx = mm(dx2, tr(bl.Wo, C, C), BT, C, C);
       const dq = new Float32Array(BT * C), dk = new Float32Array(BT * C), dv = new Float32Array(BT * C);
-      let ai = 0;
       for (let bi = 0; bi < B; bi++) for (let h = 0; h < heads; h++) {
-        const { a, qh, kh, vh } = cb.att[ai++];
+        const bz = bi * heads + h;
+        const a = cb.aAll.subarray(bz * T * T, (bz + 1) * T * T);
+        const qh = headSlice(cb.q, bi, h, T, C, hd);
+        const kh = headSlice(cb.k, bi, h, T, C, hd);
+        const vh = headSlice(cb.v, bi, h, T, C, hd);
         const dch = headSlice(dctx, bi, h, T, C, hd);        // T×hd
         const dvh = mm(tr(a, T, T), dch, T, T, hd);          // aᵀ @ dctx
         const da = mm(dch, tr(vh, T, hd), T, hd, T);         // dctx @ vᵀ
@@ -364,7 +360,7 @@
   async function trainStep(m) {
     const { X, Y } = sampleBatch(m.cfg);
     const { loss, cache } = await forward(m, X, Y);
-    const grad = backward(m, cache);
+    const grad = await backward(m, cache);
     return { loss, grad };
   }
 
