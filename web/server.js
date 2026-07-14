@@ -30,13 +30,28 @@ const PUB = path.join(__dirname, "public");
 const TYPES = { ".html": "text/html", ".js": "text/javascript",
                 ".css": "text/css", ".json": "application/json" };
 
+// keepalive: proxies (incl. HuggingFace's) close idle WebSockets — ping every
+// 30s keeps the pipe warm and detects dead clients within a minute
+setInterval(() => {
+  for (const room of rooms.values())
+    for (const [pid, v] of room.peers) {
+      if (v.ws.isAlive === false) { v.ws.terminate(); continue; }
+      v.ws.isAlive = false;
+      send(v.ws, { type: "ping" });
+    }
+}, 30000);
+
 const server = http.createServer((req, res) => {
   let p = decodeURIComponent(req.url.split("?")[0]);
   if (p === "/mode") {                 // deployment flags for the client
     res.writeHead(200, { "Content-Type": "application/json" });
     // DAISY_FORCE_ROOMS=1 (set on the HF Space): no LAN auto-grouping — every
-    // visitor creates their own private room and invites devices by link
-    return res.end(JSON.stringify({ forceRooms: !!process.env.DAISY_FORCE_ROOMS }));
+    // visitor creates their own private room and invites devices by link.
+    // DAISY_RTC_CONFIG: optional JSON RTCPeerConnection config (own TURN etc.,
+    // PairDrop-style server-provided rtcConfig).
+    let rtc = null;
+    try { if (process.env.DAISY_RTC_CONFIG) rtc = JSON.parse(process.env.DAISY_RTC_CONFIG); } catch (e) {}
+    return res.end(JSON.stringify({ forceRooms: !!process.env.DAISY_FORCE_ROOMS, rtc }));
   }
   if (p === "/") p = "/index.html";
   const file = path.join(PUB, path.normalize(p));
@@ -89,6 +104,14 @@ wss.on("connection", (ws, req) => {
     if (msg.type === "signal" && msg.to && room.peers.has(id)) {   // relay WebRTC signaling
       const target = room.peers.get(msg.to);
       if (target) send(target.ws, { type: "signal", from: id, data: msg.data });
+    } else if (msg.type === "pong") {                              // keepalive reply
+      ws.isAlive = true;
+    } else if (msg.type === "relay" && msg.to && room.peers.has(id)) {
+      // PairDrop-style WS fallback: when two devices can't form a direct
+      // WebRTC path (symmetric NATs, no TURN), the training payloads flow
+      // through here instead of dropping the peer
+      const target = room.peers.get(msg.to);
+      if (target) send(target.ws, { type: "relay", from: id, data: msg.data });
     } else if (msg.type === "admit" && id === room.host) {         // host verdict on a joiner
       const p = room.pending.get(msg.id);
       if (!p) return;

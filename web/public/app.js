@@ -13,6 +13,7 @@ const STUN = [
   { urls: "turn:openrelay.metered.ca:443", username: "openrelayproject", credential: "openrelayproject" },
   { urls: "turns:openrelay.metered.ca:443?transport=tcp", username: "openrelayproject", credential: "openrelayproject" },
 ];
+let rtcConfig = { iceServers: STUN };          // /mode can override (own TURN etc.)
 
 const ui = {
   status: document.getElementById("status"),
@@ -129,6 +130,10 @@ function connectSignaling() {
       log(`${nmeOf(msg.id)} left`); cleanupPeer(msg.id); names.delete(msg.id); updatePeers();
     } else if (msg.type === "signal") {
       await onSignal(msg.from, msg.data);
+    } else if (msg.type === "ping") {          // keepalive (proxies close idle sockets)
+      ws.send(JSON.stringify({ type: "pong" }));
+    } else if (msg.type === "relay") {         // payload relayed via the server (WS fallback)
+      onGrad(msg.from, bufFromB64(msg.data));
     }
   };
 }
@@ -157,10 +162,18 @@ function addJoinRequest(id, name) {
 }
 
 function newPC(peerId) {
-  const pc = new RTCPeerConnection({ iceServers: STUN });
+  const pc = new RTCPeerConnection(rtcConfig);
   pc.onicecandidate = (e) => { if (e.candidate) signal(peerId, { candidate: e.candidate }); };
   pc.onconnectionstatechange = () => {
     if (pc.connectionState === "failed") { cleanupPeer(peerId); scheduleReconnect(peerId); }
+    // "disconnected" often self-heals; give it a grace period, then treat as failed
+    if (pc.connectionState === "disconnected")
+      setTimeout(() => {
+        if (pcs.get(peerId) === pc && pc.connectionState === "disconnected") {
+          log(`${nmeOf(peerId)} connection did not recover — redialing`);
+          cleanupPeer(peerId); scheduleReconnect(peerId);
+        }
+      }, 4000);
   };
   pcs.set(peerId, pc);
   return pc;
@@ -171,14 +184,37 @@ function newPC(peerId) {
 // them), redial with backoff. Only the higher-numbered peer initiates, so both
 // sides don't collide (offer glare). If the peer truly left, names loses them
 // and the retries stop on their own.
+// ---- WebSocket relay fallback (PairDrop's WSPeer pattern) ---------------------
+// A peer still in the room after 5 failed WebRTC attempts is reachable through
+// the signaling server even though no direct path exists (symmetric NATs, no
+// TURN). Install a pseudo data channel that relays binary over the WS instead
+// of dropping them. Devices that actually left are removed via peer-left.
+function b64FromBuf(buf) {
+  const u = new Uint8Array(buf); let s = "";
+  for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode(...u.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+function bufFromB64(s) { return Uint8Array.from(atob(s), c => c.charCodeAt(0)).buffer; }
+function makeRelayChannel(peerId) {
+  return {
+    isRelay: true,
+    get readyState() { return ws && ws.readyState === 1 && names.has(peerId) ? "open" : "closed"; },
+    get bufferedAmount() { return ws ? ws.bufferedAmount : 0; },
+    send(buf) { ws.send(JSON.stringify({ type: "relay", to: peerId, data: b64FromBuf(buf) })); },
+    close() { chans.delete(peerId); },
+  };
+}
+
 const reconnectTimers = new Map();             // peerId -> attempt count
 function scheduleReconnect(peerId, attempt = 0) {
   if (!names.has(peerId) || chans.has(peerId) || reconnectTimers.has(peerId)) return;
-  if (attempt >= 5) {                          // 5 tries, then they're out of the group
-    log(`${nmeOf(peerId)} unreachable after 5 reconnect attempts — removed from the group`);
-    cleanupPeer(peerId);
-    names.delete(peerId);
-    updatePeers();
+  if (attempt >= 5) {                          // no direct path — fall back to server relay
+    if (names.has(peerId)) {
+      log(`no direct WebRTC path to ${nmeOf(peerId)} after 5 attempts — relaying through the server instead`);
+      chans.set(peerId, makeRelayChannel(peerId));
+      updatePeers(); wake();
+      ui.start.disabled = false;
+    }
     return;
   }
   const delay = 1500 * Math.pow(2, attempt);
@@ -817,6 +853,7 @@ function buildModel(cfg) {
   // to create their own room (they become its host) or join one by code.
   try {
     const mode = await (await fetch("mode")).json();
+    if (mode.rtc) rtcConfig = mode.rtc;                  // operator-provided ICE config
     if (mode.forceRooms && !room()) {
       const lobby = document.getElementById("lobby");
       for (const c of document.querySelectorAll(".card")) if (c !== lobby) c.style.display = "none";
@@ -887,6 +924,15 @@ function buildModel(cfg) {
   }
   updatePeers();
   connectSignaling();
+  // phones suspend the page (screen off, app switch) — reconnect the moment we
+  // come back, and on network changes (wifi <-> cellular), PairDrop-style
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && (!ws || ws.readyState > 1)) { log("page woke — reconnecting"); connectSignaling(); }
+  });
+  if (navigator.connection && navigator.connection.addEventListener)
+    navigator.connection.addEventListener("change", () => {
+      if (!ws || ws.readyState > 1) { log("network changed — reconnecting"); connectSignaling(); }
+    });
   // dataset: stream the chosen dataset from HuggingFace; built-in corpus if offline
   loadDataset((ui.cfgData.value || "").trim());
   ui.start.onclick = async () => {

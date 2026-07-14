@@ -169,7 +169,9 @@
         Wv: add(`b${l}.Wv`, mk(c * c, 0.08)), Wo: add(`b${l}.Wo`, mk(c * c, 0.08)),
         W1: add(`b${l}.W1`, mk(c * hidden, 0.08)), W2: add(`b${l}.W2`, mk(hidden * c, 0.08)),
       });
-    m.Wu = add("Wu", mk(c * vocabSize(), 0.08));
+    // weight-tied unembedding: logits use embᵀ (no separate Wu). Halves the
+    // vocab-sized parameters — and with a 16k vocab that's ~half of ALL
+    // parameters, so gradients over the wire shrink ~2× too.
     m.nParams = params.reduce((a, p) => a + p.length, 0);
     return m;
   }
@@ -273,7 +275,7 @@
       cache.blocks.push(cb);
     }
     const lf = lnFwd(x, BT, C); cache.lnf = lf; cache.xf = x;
-    const logits = await vmm(lf.y, m.Wu, BT, C, vocab, ctx);
+    const logits = await vmm(lf.y, TC.transpose(m.emb, vocab, C), BT, C, vocab, ctx);  // tied: embᵀ
     // cross-entropy + dlogits
     let loss = 0;
     const dlogits = new Float32Array(BT * vocab);
@@ -298,9 +300,10 @@
     const BT = B * T, hd = C / heads, mm = TC.matmul, tr = TC.transpose;
     const g = m.params.map(p => new Float32Array(p.length));
     const gi = Object.fromEntries(m.names.map((n, i) => [n, i]));
-    // unembed
-    g[gi.Wu] = mm(tr(cache.lnf.y, BT, C), cache.dlogits, C, BT, vocab);
-    let dx = lnBwd(mm(cache.dlogits, tr(m.Wu, C, vocab), BT, vocab, C), cache.lnf.y, cache.lnf.sig, BT, C);
+    // tied unembed: logits = lnf @ embᵀ, so the unembedding gradient flows
+    // straight into emb — dlogitsᵀ @ lnf is V×C, emb's own shape
+    g[gi.emb] = mm(tr(cache.dlogits, BT, vocab), cache.lnf.y, vocab, BT, C);
+    let dx = lnBwd(mm(cache.dlogits, m.emb, BT, vocab, C), cache.lnf.y, cache.lnf.sig, BT, C);
     const scale = 1 / Math.sqrt(hd);
     for (let l = layers - 1; l >= 0; l--) {
       const bl = m.blocks[l], cb = cache.blocks[l];
