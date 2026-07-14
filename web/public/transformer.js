@@ -111,17 +111,17 @@
   const streamFineWebEdu = () => streamDataset(DEFAULT_DS);
   function datasetName() { return DATASET; }
 
-  // ---- verified matmul: float in -> quantize -> LUT multiply -> dequant -----
-  // weights/projections may go through WebGPU; attention (per-head, many small
-  // matmuls) uses the CPU LUT path — same verified units, no dispatch overhead.
-  // 3xINT8 fast-accurate GEMM (CUTLASS 3xTF32 scheme through the verified
-  // units): three exact LUT GEMMs recover ~14-bit precision from the 8-bit
-  // units — see Verified.lutMatmul3.
-  async function vmm(Xf, Wf, m, k, n, ctx) {
-    return V.lutMatmul3(Xf, Wf, m, k, n, ctx.L, ctx.matmulInt8);
+  // ---- verified matmul: block-scaled INT8 through the units ------------------
+  // CUTLASS ex. 67/81 blockwise scaling: per-row activation scales × per-column
+  // weight scales, one exact LUT/DP4A GEMM, dequant (+ optional fused ReLU) in
+  // the kernel epilogue (ex. 12). Replaces the per-tensor 3-pass: same outlier
+  // robustness at one third of the unit ops.
+  async function vmm(Xf, Wf, m, k, n, ctx, relu) {
+    return V.vgemmBlock(Xf, Wf, { m, k, n, batch: 1, relu: !!relu }, ctx.L, ctx.bgemm);
   }
-  function vmmCPU(Xf, Wf, m, k, n, ctx) {
-    return V.lutMatmul3JS(Xf, Wf, m, k, n, ctx.L);
+  // batched: one dispatch for all B×H attention-head problems (ex. 05/24)
+  async function vmmBatched(Xf, Wf, m, k, n, batch, ctx) {
+    return V.vgemmBlock(Xf, Wf, { m, k, n, batch }, ctx.L, ctx.bgemm);
   }
 
   // ---- layernorm (no affine) -------------------------------------------------
@@ -148,7 +148,9 @@
 
   // ---- model -----------------------------------------------------------------
   // cfg: { c: width, t: seq len, b: batch/device, layers, heads, steps, lr }
-  function init(cfg, L, matmulInt8) {
+  // engine: the Compute backend object ({bgemm} for the fused WebGPU path) or a
+  // legacy matmulInt8 function (Node tests, inference kit) -> CPU LUT mirror
+  function init(cfg, L, engine) {
     const c = cfg.c, layers = cfg.layers || 2, heads = cfg.heads || 2, hidden = 2 * c;
     let seed = 100;
     const mk = (nEl, scale) => { const w = randn(nEl, mulberry32(seed++)); for (let i = 0; i < nEl; i++) w[i] *= scale; return w; };
@@ -156,7 +158,7 @@
     const add = (name, w) => { params.push(w); names.push(name); return w; };
     const m = {
       cfg: { ...cfg, layers, heads, hidden, vocab: vocabSize() },
-      ctx: { L, matmulInt8 },
+      ctx: { L, bgemm: (engine && engine.bgemm) || null },
       emb: add("emb", mk(vocabSize() * c, 0.08)),
       pos: add("pos", mk(cfg.t * c, 0.02)),
       blocks: [], params, names,
@@ -217,22 +219,43 @@
       const ctxOut = new Float32Array(BT * C);
       cb.att = [];                                     // per (b,h): softmax probs
       const scale = 1 / Math.sqrt(hd);
+      // gather every head into batched contiguous layouts, then run ALL B×H
+      // score GEMMs in ONE batched dispatch (and all attn·V in another) —
+      // instead of 2·B·H tiny sequential matmuls
+      const BH = B * heads;
+      const qb = new Float32Array(BH * T * hd), kb = new Float32Array(BH * T * hd);
+      const vb = new Float32Array(BH * T * hd), ktb = new Float32Array(BH * hd * T);
       for (let bi = 0; bi < B; bi++) for (let h = 0; h < heads; h++) {
-        const qh = headSlice(q, bi, h, T, C, hd), kh = headSlice(k, bi, h, T, C, hd), vh = headSlice(v, bi, h, T, C, hd);
-        const kT = TC.transpose(kh, T, hd);            // hd×T
-        const s = vmmCPU(qh, kT, T, hd, T, ctx);       // scores through the units
-        for (let i = 0; i < T * T; i++) s[i] *= scale;
-        const a = new Float32Array(T * T);             // causal softmax
+        const bz = bi * heads + h;
+        for (let ti = 0; ti < T; ti++) for (let j = 0; j < hd; j++) {
+          const src = (bi * T + ti) * C + h * hd + j;
+          qb[(bz * T + ti) * hd + j] = q[src];
+          kb[(bz * T + ti) * hd + j] = k[src];
+          vb[(bz * T + ti) * hd + j] = v[src];
+          ktb[(bz * hd + j) * T + ti] = k[src];        // kᵀ per head, for scores
+        }
+      }
+      const sAll = await vmmBatched(qb, ktb, T, hd, T, BH, ctx);   // scores through the units
+      const aAll = new Float32Array(BH * T * T);                   // causal softmax
+      for (let bz = 0; bz < BH; bz++) {
+        const so = bz * T * T;
         for (let ti = 0; ti < T; ti++) {
           let mx = -1e30;
-          for (let tj = 0; tj <= ti; tj++) mx = Math.max(mx, s[ti * T + tj]);
+          for (let tj = 0; tj <= ti; tj++) mx = Math.max(mx, sAll[so + ti * T + tj] * scale);
           let z = 0;
-          for (let tj = 0; tj <= ti; tj++) { const e = Math.exp(s[ti * T + tj] - mx); a[ti * T + tj] = e; z += e; }
-          for (let tj = 0; tj <= ti; tj++) a[ti * T + tj] /= z;
+          for (let tj = 0; tj <= ti; tj++) { const e = Math.exp(sAll[so + ti * T + tj] * scale - mx); aAll[so + ti * T + tj] = e; z += e; }
+          for (let tj = 0; tj <= ti; tj++) aAll[so + ti * T + tj] /= z;
         }
-        const ch = vmmCPU(a, vh, T, T, hd, ctx);       // attn·V through the units
-        headUnslice(ctxOut, ch, bi, h, T, C, hd, false);
-        cb.att.push({ a, qh, kh, vh });
+      }
+      const cAll = await vmmBatched(aAll, vb, T, T, hd, BH, ctx);  // attn·V through the units
+      for (let bi = 0; bi < B; bi++) for (let h = 0; h < heads; h++) {
+        const bz = bi * heads + h;
+        for (let ti = 0; ti < T; ti++) for (let j = 0; j < hd; j++)
+          ctxOut[(bi * T + ti) * C + h * hd + j] = cAll[(bz * T + ti) * hd + j];
+        cb.att.push({ a: aAll.subarray(bz * T * T, (bz + 1) * T * T),
+                      qh: qb.subarray(bz * T * hd, (bz + 1) * T * hd),
+                      kh: kb.subarray(bz * T * hd, (bz + 1) * T * hd),
+                      vh: vb.subarray(bz * T * hd, (bz + 1) * T * hd) });
       }
       cb.ctxOut = ctxOut;
       const attnOut = await vmm(ctxOut, bl.Wo, BT, C, C, ctx);
@@ -240,9 +263,9 @@
       for (let i = 0; i < x2.length; i++) x2[i] = x[i] + attnOut[i];
       cb.x2 = x2;
       const l2 = lnFwd(x2, BT, C); cb.ln2 = l2;
-      const h1 = await vmm(l2.y, bl.W1, BT, C, hidden, ctx);
+      const h1 = await vmm(l2.y, bl.W1, BT, C, hidden, ctx, true);  // ReLU fused in the epilogue
       const mask = new Uint8Array(h1.length);
-      for (let i = 0; i < h1.length; i++) { if (h1[i] > 0) mask[i] = 1; else h1[i] = 0; }
+      for (let i = 0; i < h1.length; i++) if (h1[i] > 0) mask[i] = 1;
       cb.h1 = h1; cb.mask = mask;
       const mlpOut = await vmm(h1, bl.W2, BT, hidden, C, ctx);
       x = new Float32Array(BT * C);

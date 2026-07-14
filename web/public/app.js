@@ -806,7 +806,7 @@ function cfgSliders() { return [ui.cfgC, ui.cfgT, ui.cfgB, ui.cfgSteps, ui.cfgLr
 // (re)build the mini transformer — deterministic shared init (same seeds on
 // every peer); each device samples its own batch windows from the shared corpus
 function buildModel(cfg) {
-  model = Transformer.init(cfg, L, compute.matmulInt8);
+  model = Transformer.init(cfg, L, compute);       // compute.bgemm = fused batched GPU path
   trainedSteps = 0;
 }
 
@@ -856,7 +856,7 @@ function buildModel(cfg) {
     ui.start.disabled = true;
     return;                                              // no signaling, no training
   }
-  ui.backend.textContent = `${compute.backend.toUpperCase()} — ${compute.label} · 3×INT8 fast-accurate through verified units`;
+  ui.backend.textContent = `${compute.backend.toUpperCase()} — ${compute.label} · block-scaled INT8, batched + fused epilogue, through verified units`;
   // tokenizer must load BEFORE the model is built (it sets the vocab size)
   try {
     const name = await Transformer.loadTokenizer();

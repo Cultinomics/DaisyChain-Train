@@ -66,6 +66,87 @@
     return combine3(hh, hl, lh, x, w, m * n);
   }
 
+  // ---- block-scaled verified GEMM (CUTLASS ex. 67/81 blockwise scaling) ------
+  // Per-ROW scales for the activations and per-COLUMN scales for the weights:
+  // the integer math through the mul8 LUT is completely unchanged — only the
+  // dequant uses rs[row]·cs[col] instead of one tensor-wide product, so a single
+  // outlier no longer crushes the quantization resolution of every other
+  // row/column. One LUT pass at this granularity beats the per-tensor 3-pass.
+  function quantizeRows(X, rows, cols) {
+    const q = new Int8Array(rows * cols), s = new Float32Array(rows);
+    for (let r = 0; r < rows; r++) {
+      let mx = 0;
+      for (let c = 0; c < cols; c++) { const a = Math.abs(X[r * cols + c]); if (a > mx) mx = a; }
+      const sc = Math.max(mx / 127, 1e-8); s[r] = sc;
+      for (let c = 0; c < cols; c++) {
+        const v = Math.round(X[r * cols + c] / sc);
+        q[r * cols + c] = v < -128 ? -128 : v > 127 ? 127 : v;
+      }
+    }
+    return { q, s };
+  }
+  function quantizeCols(W, rows, cols) {
+    const q = new Int8Array(rows * cols), s = new Float32Array(cols);
+    for (let c = 0; c < cols; c++) {
+      let mx = 0;
+      for (let r = 0; r < rows; r++) { const a = Math.abs(W[r * cols + c]); if (a > mx) mx = a; }
+      s[c] = Math.max(mx / 127, 1e-8);
+    }
+    for (let r = 0; r < rows; r++)
+      for (let c = 0; c < cols; c++) {
+        const v = Math.round(W[r * cols + c] / s[c]);
+        q[r * cols + c] = v < -128 ? -128 : v > 127 ? 127 : v;
+      }
+    return { q, s };
+  }
+
+  // CPU mirror of the fused GPU kernel: batched int8 GEMM through the LUT with
+  // the epilogue (block dequant + optional ReLU) applied before returning —
+  // exactly what the WGSL kernel does on-device.
+  function bgemmJS(Xq, Wq, rs, cs, d, L) {
+    const { m, k, n } = d, batch = d.batch || 1, relu = !!d.relu, mul = L.mul;
+    const out = new Float32Array(batch * m * n);
+    const acc = new Int32Array(n);
+    for (let bz = 0; bz < batch; bz++) {
+      const xo = bz * m * k, wo = bz * k * n, oo = bz * m * n, co = bz * n;
+      for (let i = 0; i < m; i++) {
+        acc.fill(0);
+        const xrow = xo + i * k;
+        for (let p = 0; p < k; p++) {
+          const au = (Xq[xrow + p] & 0xFF) * 256, wrow = wo + p * n;
+          for (let j = 0; j < n; j++) acc[j] += mul[au + (Wq[wrow + j] & 0xFF)];
+        }
+        const rscale = rs[bz * m + i], orow = oo + i * n;
+        for (let j = 0; j < n; j++) {
+          const v = acc[j] * rscale * cs[co + j];
+          out[orow + j] = relu && v < 0 ? 0 : v;
+        }
+      }
+    }
+    return out;
+  }
+
+  // block-scaled verified GEMM, float in → float out.
+  //   d = { m, k, n, batch=1, relu=false }; X is (batch·m)×k, W is batch×(k×n)
+  // gpuBgemm (from webgpu.js) runs the batched kernel with the fused epilogue;
+  // without it the CPU LUT mirror runs. Every product goes through the units.
+  async function vgemmBlock(Xf, Wf, d, L, gpuBgemm) {
+    const { m, k, n } = d, batch = d.batch || 1;
+    const x = quantizeRows(Xf, batch * m, k);
+    let wq, ws;
+    if (batch === 1) {
+      const w = quantizeCols(Wf, k, n); wq = w.q; ws = w.s;
+    } else {
+      wq = new Int8Array(batch * k * n); ws = new Float32Array(batch * n);
+      for (let bz = 0; bz < batch; bz++) {
+        const w = quantizeCols(Wf.subarray(bz * k * n, (bz + 1) * k * n), k, n);
+        wq.set(w.q, bz * k * n); ws.set(w.s, bz * n);
+      }
+    }
+    if (gpuBgemm) return gpuBgemm(x.q, wq, x.s, ws, d);
+    return bgemmJS(x.q, wq, x.s, ws, d, L);
+  }
+
   // one verified layer forward; returns float out (+ cache for STE backward).
   // Every product goes through the verified INT8 multiply (mul8 LUT) with exact
   // int32 accumulation — i.e. an emulated INT8 tensor-core GEMM — then dequant.
@@ -116,7 +197,8 @@
     for (let j = 0; j < W2.length; j++) W2[j] -= lr * gAvg[W1.length + j];
   }
 
-  const api = { quantize, quantize2, lutMatmulJS, lutMatmul3JS, lutMatmul3, linearFwd, forward, backward, splitApply };
+  const api = { quantize, quantize2, quantizeRows, quantizeCols, lutMatmulJS, lutMatmul3JS, lutMatmul3,
+                bgemmJS, vgemmBlock, linearFwd, forward, backward, splitApply };
   if (typeof module !== "undefined" && module.exports) { TC = require("./traincore.js"); module.exports = api; }
   else { TC = root.TrainCore; root.Verified = api; }
 })(typeof self !== "undefined" ? self : this);
