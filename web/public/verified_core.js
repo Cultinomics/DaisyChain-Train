@@ -100,12 +100,23 @@
     return { q, s };
   }
 
+  // ---- epilogue mirror -------------------------------------------------------
+  // BIT-EXACT mirror of the WGSL epilogue `f32(s) * a * b`. WGSL rounds to f32
+  // after the int->float conversion and after EACH multiply; plain JS would do
+  // the whole chain in f64 and round once, which differs in the last ulp. That
+  // last-ulp gap is what used to force a tolerance into the kernel gates —
+  // mirroring the rounding exactly is what lets the gates compare with `!==`.
+  const f32 = Math.fround;
+  function epi(s, a, b) { return f32(f32(f32(s) * a) * b); }
+
   // CPU mirror of the fused GPU kernel: batched int8 GEMM through the LUT with
   // the epilogue (block dequant + optional ReLU) applied before returning —
-  // exactly what the WGSL kernel does on-device.
+  // exactly what the WGSL kernel does on-device. d.acc=true returns the raw
+  // int32 accumulator instead (the exact oracle the fused kernel normally hides).
   function bgemmJS(Xq, Wq, rs, cs, d, L) {
     const { m, k, n } = d, batch = d.batch || 1, relu = !!d.relu, mul = L.mul;
-    const out = new Float32Array(batch * m * n);
+    const raw = !!d.acc;
+    const out = raw ? new Int32Array(batch * m * n) : new Float32Array(batch * m * n);
     const acc = new Int32Array(n);
     for (let bz = 0; bz < batch; bz++) {
       const xo = bz * m * k, wo = bz * k * n, oo = bz * m * n, co = bz * n;
@@ -116,9 +127,11 @@
           const au = (Xq[xrow + p] & 0xFF) * 256, wrow = wo + p * n;
           for (let j = 0; j < n; j++) acc[j] += mul[au + (Wq[wrow + j] & 0xFF)];
         }
-        const rscale = rs[bz * m + i], orow = oo + i * n;
+        const orow = oo + i * n;
+        if (raw) { for (let j = 0; j < n; j++) out[orow + j] = acc[j]; continue; }
+        const rscale = rs[bz * m + i];
         for (let j = 0; j < n; j++) {
-          const v = acc[j] * rscale * cs[co + j];
+          const v = epi(acc[j], rscale, cs[co + j]);
           out[orow + j] = relu && v < 0 ? 0 : v;
         }
       }
@@ -126,11 +139,32 @@
     return out;
   }
 
+  // Recompute a handful of RANDOM output cells of a live GEMM through the LUT
+  // mirror and compare against what the kernel produced. Sampling cells instead
+  // of whole matrices makes this cheap enough to run continuously, at the real
+  // shapes training uses — not once at boot on toy inputs.
+  function auditTile(Xq, Wq, rs, cs, d, got, L, nCells) {
+    const { m, k, n } = d, batch = d.batch || 1, relu = !!d.relu, mul = L.mul;
+    for (let t = 0; t < (nCells || 8); t++) {
+      const bz = (Math.random() * batch) | 0;
+      const i = (Math.random() * m) | 0, j = (Math.random() * n) | 0;
+      let acc = 0;
+      const xrow = bz * m * k + i * k, wo = bz * k * n;
+      for (let p = 0; p < k; p++) acc += mul[(Xq[xrow + p] & 0xFF) * 256 + (Wq[wo + p * n + j] & 0xFF)];
+      let v = epi(acc, rs[bz * m + i], cs[bz * n + j]);
+      if (relu && v < 0) v = 0;
+      const idx = (bz * m + i) * n + j;
+      if (got[idx] !== v)
+        return `GEMM audit failed at [b${bz},${i},${j}] shape ${m}x${k}x${n}: kernel ${got[idx]} vs units ${v}`;
+    }
+    return null;
+  }
+
   // block-scaled verified GEMM, float in → float out.
   //   d = { m, k, n, batch=1, relu=false }; X is (batch·m)×k, W is batch×(k×n)
   // gpuBgemm (from webgpu.js) runs the batched kernel with the fused epilogue;
   // without it the CPU LUT mirror runs. Every product goes through the units.
-  async function vgemmBlock(Xf, Wf, d, L, gpuBgemm) {
+  async function vgemmBlock(Xf, Wf, d, L, gpuBgemm, audit) {
     const { m, k, n } = d, batch = d.batch || 1;
     const x = quantizeRows(Xf, batch * m, k);
     let wq, ws;
@@ -143,7 +177,16 @@
         wq.set(w.q, bz * k * n); ws.set(w.s, bz * n);
       }
     }
-    if (gpuBgemm) return gpuBgemm(x.q, wq, x.s, ws, d);
+    if (gpuBgemm) {
+      const out = await gpuBgemm(x.q, wq, x.s, ws, d);
+      // continuous re-verification at LIVE shapes: the boot gate only ever saw
+      // toy inputs, so sample a few real cells against the units as we go
+      if (audit && audit.due()) {
+        const bad = auditTile(x.q, wq, x.s, ws, d, out, L, audit.cells);
+        if (bad) audit.fail(bad);
+      }
+      return out;
+    }
     return bgemmJS(x.q, wq, x.s, ws, d, L);
   }
 
@@ -176,9 +219,10 @@
     return { q, s };
   }
   // scores S[bz,ti,tj] = q_row(bi,ti,h) · k_row(bi,tj,h), every product via the LUT
+  // d.acc=true returns the raw int32 accumulator (exact oracle for the kernel gate)
   function attScoresJS(qq, kq, qs, ks, d, L) {
-    const { B, T, heads, hd } = d, C = heads * hd, mul = L.mul;
-    const out = new Float32Array(B * heads * T * T);
+    const { B, T, heads, hd } = d, C = heads * hd, mul = L.mul, raw = !!d.acc;
+    const out = raw ? new Int32Array(B * heads * T * T) : new Float32Array(B * heads * T * T);
     for (let bi = 0; bi < B; bi++) for (let h = 0; h < heads; h++) {
       const bz = bi * heads + h;
       for (let ti = 0; ti < T; ti++) {
@@ -187,7 +231,7 @@
           const ko = (bi * T + tj) * C + h * hd;
           let acc = 0;
           for (let p = 0; p < hd; p++) acc += mul[(qq[qo + p] & 0xFF) * 256 + (kq[ko + p] & 0xFF)];
-          out[(bz * T + ti) * T + tj] = acc * rscale * ks[(bi * T + tj) * heads + h];
+          out[(bz * T + ti) * T + tj] = raw ? acc : epi(acc, rscale, ks[(bi * T + tj) * heads + h]);
         }
       }
     }
@@ -195,8 +239,8 @@
   }
   // ctx[(bi,ti),(h,j)] = Σ_tj a[bz,ti,tj]·v[(bi,tj),(h,j)] — scatter fused into BT×C
   function attCtxJS(aq, vq, as, vs, d, L) {
-    const { B, T, heads, hd } = d, C = heads * hd, mul = L.mul;
-    const out = new Float32Array(B * T * C);
+    const { B, T, heads, hd } = d, C = heads * hd, mul = L.mul, raw = !!d.acc;
+    const out = raw ? new Int32Array(B * T * C) : new Float32Array(B * T * C);
     for (let bi = 0; bi < B; bi++) for (let h = 0; h < heads; h++) {
       const bz = bi * heads + h;
       for (let ti = 0; ti < T; ti++) {
@@ -205,7 +249,7 @@
           let acc = 0;
           for (let tj = 0; tj < T; tj++)
             acc += mul[(aq[ao + tj] & 0xFF) * 256 + (vq[(bi * T + tj) * C + h * hd + j] & 0xFF)];
-          out[(bi * T + ti) * C + h * hd + j] = acc * rscale * vs[(bi * heads + h) * hd + j];
+          out[(bi * T + ti) * C + h * hd + j] = raw ? acc : epi(acc, rscale, vs[(bi * heads + h) * hd + j]);
         }
       }
     }
@@ -263,7 +307,7 @@
   }
 
   const api = { quantize, quantize2, quantizeRows, quantizeCols, quantizeHeadCols, lutMatmulJS, lutMatmul3JS, lutMatmul3,
-                bgemmJS, vgemmBlock, attScoresJS, attCtxJS, linearFwd, forward, backward, splitApply };
+                bgemmJS, vgemmBlock, auditTile, epi, attScoresJS, attCtxJS, linearFwd, forward, backward, splitApply };
   if (typeof module !== "undefined" && module.exports) { TC = require("./traincore.js"); module.exports = api; }
   else { TC = root.TrainCore; root.Verified = api; }
 })(typeof self !== "undefined" ? self : this);

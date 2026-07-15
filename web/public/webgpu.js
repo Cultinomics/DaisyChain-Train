@@ -35,36 +35,32 @@
       C[row * n + col] = s;
     }`;
 
-  // X packed 4×int8 along k; W transposed then packed the same way, so each
-  // thread streams two contiguous rows of u32 words through dot4I8Packed.
-  const WGSL_DP4 = `
-    @group(0) @binding(0) var<storage, read> Xp : array<u32>;
-    @group(0) @binding(1) var<storage, read> Wp : array<u32>;    // Wᵀ, packed
-    @group(0) @binding(2) var<storage, read_write> C : array<i32>;
-    @group(0) @binding(3) var<uniform> dims : vec3<u32>;         // m, kw=ceil(k/4), n
-    @compute @workgroup_size(8, 8)
-    fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-      let m = dims.x; let kw = dims.y; let n = dims.z;
-      let row = gid.x; let col = gid.y;
-      if (row >= m || col >= n) { return; }
-      var s : i32 = 0;
-      for (var p = 0u; p < kw; p = p + 1u) {
-        s = s + dot4I8Packed(Xp[row * kw + p], Wp[col * kw + p]);
-      }
-      C[row * n + col] = s;
-    }`;
+  // NOTE: the un-batched DP4A matmul that used to live here was removed. It was
+  // the only kernel with an exact gate, but the transformer stopped calling it
+  // when the block-scaled path landed — so it sat here passing its own gate
+  // while verifying nothing that ran. A gate on a kernel nobody calls is worse
+  // than no gate: it reads like coverage. The batched kernels below are the
+  // ones training uses, and they now carry that exact gate instead.
 
   // Batched block-scaled GEMM with a FUSED EPILOGUE (CUTLASS ex. 05/24 + 12):
   // grid z = batch index, so ALL attention heads run in ONE dispatch, and the
   // epilogue (block dequant rs·cs + optional ReLU) happens before the data
   // leaves the GPU — f32 out, no int32 readback, no second pass in JS.
-  const WGSL_BG_LUT = `
+  // Each kernel is emitted in two variants from ONE source string: the live one
+  // (fused epilogue, f32 out) and a `verify` one that writes the raw int32
+  // accumulator instead. The indexing — the part that actually goes wrong — is
+  // textually identical, so gating the verify variant genuinely gates the live
+  // kernel, and the comparison is EXACT (int8xint8->int32 has no rounding to
+  // hide in) instead of an allclose that whole bug classes walk through.
+  const OUT_DECL = (v, b) => `@group(0) @binding(${b}) var<storage, read_write> O : array<${v ? "i32" : "f32"}>;`;
+
+  const WGSL_BG_LUT = (verify) => `
     @group(0) @binding(0) var<storage, read> Xq  : array<i32>;   // int8 byte per elem
     @group(0) @binding(1) var<storage, read> Wq  : array<i32>;
     @group(0) @binding(2) var<storage, read> lut : array<i32>;
     @group(0) @binding(3) var<storage, read> rs  : array<f32>;   // per (batch,row)
     @group(0) @binding(4) var<storage, read> cs  : array<f32>;   // per (batch,col)
-    @group(0) @binding(5) var<storage, read_write> O : array<f32>;
+    ${OUT_DECL(verify, 5)}
     @group(0) @binding(6) var<uniform> dims : vec4<u32>;         // m, k, n, flags(1=relu)
     @compute @workgroup_size(8, 8, 1)
     fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
@@ -79,18 +75,19 @@
         let bu = u32(Wq[wo + p * n] & 255);
         s = s + lut[au * 256u + bu];
       }
+      ${verify ? `O[(bz * m + row) * n + col] = s;` : `
       var v = f32(s) * rs[bz * m + row] * cs[bz * n + col];
       if ((dims.w & 1u) == 1u && v < 0.0) { v = 0.0; }
-      O[(bz * m + row) * n + col] = v;
+      O[(bz * m + row) * n + col] = v;`}
     }`;
 
   // same fused/batched kernel on the DP4A hardware path (Wᵀ packed per batch)
-  const WGSL_BG_DP4 = `
+  const WGSL_BG_DP4 = (verify) => `
     @group(0) @binding(0) var<storage, read> Xp : array<u32>;
     @group(0) @binding(1) var<storage, read> Wp : array<u32>;    // per-batch Wᵀ, packed
     @group(0) @binding(2) var<storage, read> rs : array<f32>;
     @group(0) @binding(3) var<storage, read> cs : array<f32>;
-    @group(0) @binding(4) var<storage, read_write> O : array<f32>;
+    ${OUT_DECL(verify, 4)}
     @group(0) @binding(5) var<uniform> dims : vec4<u32>;         // m, kw, n, flags
     @compute @workgroup_size(8, 8, 1)
     fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
@@ -103,21 +100,22 @@
       for (var p = 0u; p < kw; p = p + 1u) {
         s = s + dot4I8Packed(Xp[xo + p], Wp[wo + p]);
       }
+      ${verify ? `O[(bz * m + row) * n + col] = s;` : `
       var v = f32(s) * rs[bz * m + row] * cs[bz * n + col];
       if ((dims.w & 1u) == 1u && v < 0.0) { v = 0.0; }
-      O[(bz * m + row) * n + col] = v;
+      O[(bz * m + row) * n + col] = v;`}
     }`;
 
   // Gather-fused attention (CUTLASS ex. 36/52): kernels index q/k/v directly in
   // their BT×C layout (head-strided) — no gather copies, no kᵀ transpose — and
   // the ctx kernel scatters straight back into BT×C. int8×int8→i32 is exact, so
   // these are bit-identical to the LUT mirrors (proved at init before use).
-  const WGSL_ATT_SCORES = `
+  const WGSL_ATT_SCORES = (verify) => `
     @group(0) @binding(0) var<storage, read> Q : array<i32>;     // int8 per elem, BT×C
     @group(0) @binding(1) var<storage, read> K : array<i32>;
     @group(0) @binding(2) var<storage, read> qs : array<f32>;    // per (token,head)
     @group(0) @binding(3) var<storage, read> ks : array<f32>;
-    @group(0) @binding(4) var<storage, read_write> O : array<f32>;
+    ${OUT_DECL(verify, 4)}
     @group(0) @binding(5) var<uniform> dims : vec4<u32>;         // T, heads, hd, _
     @compute @workgroup_size(8, 8, 1)
     fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
@@ -130,14 +128,15 @@
       let ko = (bi * T + tj) * C + h * hd;
       var s : i32 = 0;
       for (var p = 0u; p < hd; p = p + 1u) { s = s + Q[qo + p] * K[ko + p]; }
-      O[(bz * T + ti) * T + tj] = f32(s) * qs[(bi * T + ti) * heads + h] * ks[(bi * T + tj) * heads + h];
+      ${verify ? `O[(bz * T + ti) * T + tj] = s;`
+               : `O[(bz * T + ti) * T + tj] = f32(s) * qs[(bi * T + ti) * heads + h] * ks[(bi * T + tj) * heads + h];`}
     }`;
-  const WGSL_ATT_CTX = `
+  const WGSL_ATT_CTX = (verify) => `
     @group(0) @binding(0) var<storage, read> A : array<i32>;     // int8, BH×T×T
     @group(0) @binding(1) var<storage, read> V : array<i32>;     // int8, BT×C
     @group(0) @binding(2) var<storage, read> as_ : array<f32>;   // per (bz,row)
     @group(0) @binding(3) var<storage, read> vs : array<f32>;    // per (batch,head,chan)
-    @group(0) @binding(4) var<storage, read_write> O : array<f32>;  // BT×C (scatter fused)
+    ${OUT_DECL(verify, 4)}                                       // BT×C (scatter fused)
     @group(0) @binding(5) var<uniform> dims : vec4<u32>;         // T, heads, hd, _
     @compute @workgroup_size(8, 8, 1)
     fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
@@ -149,7 +148,8 @@
       let ao = (bz * T + ti) * T;
       var s : i32 = 0;
       for (var tj = 0u; tj < T; tj = tj + 1u) { s = s + A[ao + tj] * V[(bi * T + tj) * C + h * hd + j]; }
-      O[(bi * T + ti) * C + h * hd + j] = f32(s) * as_[bz * T + ti] * vs[(bi * heads + h) * hd + j];
+      ${verify ? `O[(bi * T + ti) * C + h * hd + j] = s;`
+               : `O[(bi * T + ti) * C + h * hd + j] = f32(s) * as_[bz * T + ti] * vs[(bi * heads + h) * hd + j];`}
     }`;
 
   // Split-K f32 GEMM (CUTLASS ex. 06) for the STE BACKWARD only — the backward
@@ -237,32 +237,58 @@
       const lut32 = new Int32Array(L.mul);   // widen int16 -> int32
       const lutBuf = device.createBuffer({ size: lut32.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
       device.queue.writeBuffer(lutBuf, 0, lut32);
-      const bgLutModule = device.createShaderModule({ code: WGSL_BG_LUT });
-      const bgLutPipe = device.createComputePipeline({ layout: "auto", compute: { module: bgLutModule, entryPoint: "main" } });
-
-      // gather-fused attention kernels — must reproduce the LUT mirrors exactly
       const mkPipe = (code) => device.createComputePipeline({ layout: "auto",
         compute: { module: device.createShaderModule({ code }), entryPoint: "main" } });
-      const scoresPipe = mkPipe(WGSL_ATT_SCORES), ctxPipe = mkPipe(WGSL_ATT_CTX);
-      let att = { scores: (qq, kq, qs, ks, d) => gpuAttScores(device, scoresPipe, qq, kq, qs, ks, d),
-                  ctx: (aq, vq, as, vs, d) => gpuAttCtx(device, ctxPipe, aq, vq, as, vs, d) };
+      // The verify variant doesn't reference the scale buffers, so `layout:auto`
+      // would strip those bindings and the bind group would silently mismatch.
+      // An EXPLICIT layout keeps both variants binding-compatible — which is the
+      // point: they must differ only in the final write, nothing else.
+      const mkLayout = (spec) => device.createBindGroupLayout({
+        entries: spec.map((t, i) => ({ binding: i, visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: t === "u" ? "uniform" : t === "rw" ? "storage" : "read-only-storage" } })) });
+      const mkPipeL = (code, layout) => device.createComputePipeline({
+        layout: device.createPipelineLayout({ bindGroupLayouts: [layout] }),
+        compute: { module: device.createShaderModule({ code }), entryPoint: "main" } });
+      const bgLutLayout = mkLayout(["r", "r", "r", "r", "r", "rw", "u"]);
+      const bgDp4Layout = mkLayout(["r", "r", "r", "r", "rw", "u"]);
+      const attLayout = mkLayout(["r", "r", "r", "r", "rw", "u"]);
+      // live + verify variants, compiled from the same source (see WGSL_* above)
+      const bgLutPipe = mkPipeL(WGSL_BG_LUT(false), bgLutLayout), bgLutVPipe = mkPipeL(WGSL_BG_LUT(true), bgLutLayout);
+      const scoresPipe = mkPipeL(WGSL_ATT_SCORES(false), attLayout), scoresVPipe = mkPipeL(WGSL_ATT_SCORES(true), attLayout);
+      const ctxPipe = mkPipeL(WGSL_ATT_CTX(false), attLayout), ctxVPipe = mkPipeL(WGSL_ATT_CTX(true), attLayout);
+
+      // gather-fused attention kernels. The gate runs the VERIFY variant of the
+      // same source and compares the int32 accumulator with `!==` — exact, no
+      // tolerance — then checks the fused epilogue against a bit-exact JS mirror
+      // of the WGSL rounding. Swept over several shapes, incl. odd/ragged ones,
+      // because head-strided addressing is where these kernels can go wrong.
+      let att = { scores: (qq, kq, qs, ks, d) => gpuAttScores(device, d.acc ? scoresVPipe : scoresPipe, qq, kq, qs, ks, d),
+                  ctx: (aq, vq, as, vs, d) => gpuAttCtx(device, d.acc ? ctxVPipe : ctxPipe, aq, vq, as, vs, d) };
       try {
-        const d0 = { B: 2, T: 8, heads: 2, hd: 8 };
-        const nQ = d0.B * d0.T * d0.heads * d0.hd;
-        const qq = new Int8Array(nQ), kq = new Int8Array(nQ), vq = new Int8Array(nQ);
-        for (let i = 0; i < nQ; i++) { qq[i] = (Math.random() * 256 - 128) | 0; kq[i] = (Math.random() * 256 - 128) | 0; vq[i] = (Math.random() * 256 - 128) | 0; }
-        const qs = Float32Array.from({ length: d0.B * d0.T * d0.heads }, () => Math.random() + 0.5);
-        const ks = Float32Array.from(qs, () => Math.random() + 0.5);
-        const aq = new Int8Array(d0.B * d0.heads * d0.T * d0.T);
-        for (let i = 0; i < aq.length; i++) aq[i] = (Math.random() * 127) | 0;
-        const as = Float32Array.from({ length: d0.B * d0.heads * d0.T }, () => Math.random() + 0.5);
-        const vs = Float32Array.from({ length: d0.B * d0.heads * d0.hd }, () => Math.random() + 0.5);
-        const [hwS, hwC] = await Promise.all([att.scores(qq, kq, qs, ks, d0), att.ctx(aq, vq, as, vs, d0)]);
-        const refS = root.Verified.attScoresJS(qq, kq, qs, ks, d0, L);
-        const refC = root.Verified.attCtxJS(aq, vq, as, vs, d0, L);
-        const close = (a, b) => Math.abs(a - b) <= Math.abs(b) * 1e-6 + 1e-6;
-        for (let i = 0; i < refS.length; i++) if (!close(hwS[i], refS[i])) throw new Error("scores mismatch");
-        for (let i = 0; i < refC.length; i++) if (!close(hwC[i], refC[i])) throw new Error("ctx mismatch");
+        for (const d0 of [{ B: 2, T: 8, heads: 2, hd: 8 }, { B: 1, T: 32, heads: 2, hd: 16 },
+                          { B: 3, T: 7, heads: 3, hd: 5 }, { B: 2, T: 33, heads: 4, hd: 8 }]) {
+          const nQ = d0.B * d0.T * d0.heads * d0.hd;
+          const qq = new Int8Array(nQ), kq = new Int8Array(nQ), vq = new Int8Array(nQ);
+          for (let i = 0; i < nQ; i++) { qq[i] = (Math.random() * 256 - 128) | 0; kq[i] = (Math.random() * 256 - 128) | 0; vq[i] = (Math.random() * 256 - 128) | 0; }
+          const qs = Float32Array.from({ length: d0.B * d0.T * d0.heads }, () => Math.random() + 0.5);
+          const ks = Float32Array.from({ length: d0.B * d0.T * d0.heads }, () => Math.random() + 0.5);
+          const aq = new Int8Array(d0.B * d0.heads * d0.T * d0.T);
+          for (let i = 0; i < aq.length; i++) aq[i] = (Math.random() * 127) | 0;
+          const as = Float32Array.from({ length: d0.B * d0.heads * d0.T }, () => Math.random() + 0.5);
+          const vs = Float32Array.from({ length: d0.B * d0.heads * d0.hd }, () => Math.random() + 0.5);
+          const dv = { ...d0, acc: true };
+          const [accS, accC, hwS, hwC] = await Promise.all([
+            att.scores(qq, kq, qs, ks, dv), att.ctx(aq, vq, as, vs, dv),
+            att.scores(qq, kq, qs, ks, d0), att.ctx(aq, vq, as, vs, d0)]);
+          const refAccS = root.Verified.attScoresJS(qq, kq, qs, ks, dv, L);
+          const refAccC = root.Verified.attCtxJS(aq, vq, as, vs, dv, L);
+          for (let i = 0; i < refAccS.length; i++) if (accS[i] !== refAccS[i]) throw new Error(`scores accumulator mismatch @${i} shape ${JSON.stringify(d0)}`);
+          for (let i = 0; i < refAccC.length; i++) if (accC[i] !== refAccC[i]) throw new Error(`ctx accumulator mismatch @${i} shape ${JSON.stringify(d0)}`);
+          const refS = root.Verified.attScoresJS(qq, kq, qs, ks, d0, L);
+          const refC = root.Verified.attCtxJS(aq, vq, as, vs, d0, L);
+          for (let i = 0; i < refS.length; i++) if (hwS[i] !== refS[i]) throw new Error(`scores epilogue mismatch @${i}`);
+          for (let i = 0; i < refC.length; i++) if (hwC[i] !== refC[i]) throw new Error(`ctx epilogue mismatch @${i}`);
+        }
       } catch (e) {
         console.warn("fused attention kernels failed verification — using CPU LUT mirrors:", e.message);
         att = null;
@@ -284,51 +310,55 @@
         fgemm = null;
       }
 
-      const viaLUT = { backend: "webgpu", label: `${gpuName} (LUT shader)`,
-                       matmulInt8: (Xq, Wq, m, k, n) => gpuMatmulLUT(device, lutPipe, lutBuf, Xq, Wq, m, k, n),
-                       bgemm: (Xq, Wq, rs, cs, d) => gpuBgemmLUT(device, bgLutPipe, lutBuf, Xq, Wq, rs, cs, d),
-                       att, fgemm };
+      // Shared exact gate for a bgemm implementation. Sweeps shapes (including
+      // ragged ones and a k long enough to matter), compares the int32
+      // accumulator from the verify variant with `!==`, then compares the fused
+      // f32 epilogue against the bit-exact JS mirror. Returns null if clean.
+      async function gateBgemm(bgFn) {
+        for (const d0 of [{ m: 5, k: 9, n: 6, batch: 3, relu: true },
+                          { m: 32, k: 64, n: 32, batch: 1, relu: false },
+                          { m: 7, k: 253, n: 5, batch: 2, relu: true },
+                          { m: 1, k: 4, n: 1, batch: 1, relu: false },
+                          { m: 17, k: 33, n: 9, batch: 1, relu: true }]) {
+          const Xq = new Int8Array(d0.batch * d0.m * d0.k), Wq = new Int8Array(d0.batch * d0.k * d0.n);
+          for (let i = 0; i < Xq.length; i++) Xq[i] = (Math.random() * 256 - 128) | 0;
+          for (let i = 0; i < Wq.length; i++) Wq[i] = (Math.random() * 256 - 128) | 0;
+          const rs = Float32Array.from({ length: d0.batch * d0.m }, () => Math.random() + 0.5);
+          const cs = Float32Array.from({ length: d0.batch * d0.n }, () => Math.random() + 0.5);
+          const shape = `${d0.m}x${d0.k}x${d0.n}b${d0.batch}`;
+          const accHw = await bgFn(Xq, Wq, rs, cs, { ...d0, acc: true });
+          const accRef = root.Verified.bgemmJS(Xq, Wq, rs, cs, { ...d0, acc: true }, L);
+          for (let i = 0; i < accRef.length; i++)
+            if (accHw[i] !== accRef[i]) return `accumulator mismatch @${i} (${shape}): ${accHw[i]} vs ${accRef[i]}`;
+          const hw = await bgFn(Xq, Wq, rs, cs, d0);
+          const ref = root.Verified.bgemmJS(Xq, Wq, rs, cs, d0, L);
+          for (let i = 0; i < ref.length; i++)
+            if (hw[i] !== ref[i]) return `epilogue mismatch @${i} (${shape}): ${hw[i]} vs ${ref[i]}`;
+        }
+        return null;
+      }
 
-      // DP4A pipeline — only if the WGSL feature exists AND it reproduces the
-      // verified units exactly on random self-tests
+      const bgLut = (Xq, Wq, rs, cs, d) => gpuBgemmLUT(device, d.acc ? bgLutVPipe : bgLutPipe, lutBuf, Xq, Wq, rs, cs, d);
+      // the LUT bgemm is the fallback AND the oracle's shader twin — gate it too
+      const lutBad = await gateBgemm(bgLut);
+      if (lutBad) { console.warn("LUT bgemm shader failed verification — CPU mirrors only:", lutBad); return cpu; }
+      const viaLUT = { backend: "webgpu", label: `${gpuName} (LUT shader · exact-gated)`,
+                       matmulInt8: (Xq, Wq, m, k, n) => gpuMatmulLUT(device, lutPipe, lutBuf, Xq, Wq, m, k, n),
+                       bgemm: bgLut, att, fgemm };
+
+      // DP4A pipeline — only if the WGSL feature exists AND its batched kernel
+      // reproduces the verified units exactly across the shape sweep
       if (!(navigator.gpu.wgslLanguageFeatures && navigator.gpu.wgslLanguageFeatures.has("packed_4x8_integer_dot_product")))
         return viaLUT;
-      const dp4Module = device.createShaderModule({ code: WGSL_DP4 });
-      const dp4Pipe = device.createComputePipeline({ layout: "auto", compute: { module: dp4Module, entryPoint: "main" } });
-      const dp4mm = (Xq, Wq, m, k, n) => gpuMatmulDP4(device, dp4Pipe, Xq, Wq, m, k, n);
-      for (let trial = 0; trial < 3; trial++) {         // hardware vs verified units
-        const m0 = 5 + trial, k0 = 7 + 3 * trial, n0 = 6 + trial;
-        const Xq = new Int8Array(m0 * k0), Wq = new Int8Array(k0 * n0);
-        for (let i = 0; i < Xq.length; i++) Xq[i] = (Math.random() * 256 - 128) | 0;
-        for (let i = 0; i < Wq.length; i++) Wq[i] = (Math.random() * 256 - 128) | 0;
-        const hw = await dp4mm(Xq, Wq, m0, k0, n0);
-        const ref = root.Verified.lutMatmulJS(Xq, Wq, m0, k0, n0, L);
-        for (let i = 0; i < ref.length; i++)
-          if (hw[i] !== ref[i]) { console.warn("DP4A disagreed with the verified units — using LUT shader"); return viaLUT; }
+      const bgDp4Pipe = mkPipeL(WGSL_BG_DP4(false), bgDp4Layout), bgDp4VPipe = mkPipeL(WGSL_BG_DP4(true), bgDp4Layout);
+      const bg = (Xq, Wq, rs, cs, d) => gpuBgemmDP4(device, d.acc ? bgDp4VPipe : bgDp4Pipe, Xq, Wq, rs, cs, d);
+      const dp4Bad = await gateBgemm(bg);
+      if (dp4Bad) {
+        console.warn("batched DP4A disagreed with the verified units — using LUT bgemm:", dp4Bad);
+        return viaLUT;
       }
-      // fused/batched DP4A kernel, gated by the same verification: it must
-      // reproduce the CPU LUT mirror bit-for-bit on the integer accumulate
-      const bgDp4Module = device.createShaderModule({ code: WGSL_BG_DP4 });
-      const bgDp4Pipe = device.createComputePipeline({ layout: "auto", compute: { module: bgDp4Module, entryPoint: "main" } });
-      const bg = (Xq, Wq, rs, cs, d) => gpuBgemmDP4(device, bgDp4Pipe, Xq, Wq, rs, cs, d);
-      {
-        const d0 = { m: 5, k: 9, n: 6, batch: 3, relu: true };
-        const Xq = new Int8Array(d0.batch * d0.m * d0.k), Wq = new Int8Array(d0.batch * d0.k * d0.n);
-        for (let i = 0; i < Xq.length; i++) Xq[i] = (Math.random() * 256 - 128) | 0;
-        for (let i = 0; i < Wq.length; i++) Wq[i] = (Math.random() * 256 - 128) | 0;
-        const rs = new Float32Array(d0.batch * d0.m).fill(0).map(() => Math.random() + 0.5);
-        const cs = new Float32Array(d0.batch * d0.n).fill(0).map(() => Math.random() + 0.5);
-        const hw = await bg(Xq, Wq, rs, cs, d0);
-        const ref = root.Verified.bgemmJS(Xq, Wq, rs, cs, d0, L);
-        for (let i = 0; i < ref.length; i++)
-          if (Math.abs(hw[i] - ref[i]) > Math.abs(ref[i]) * 1e-6 + 1e-6) {
-            console.warn("batched DP4A disagreed with the verified units — using LUT bgemm");
-            return { backend: "webgpu", label: `${gpuName} (DP4A int8 dot — HW verified vs units)`,
-                     matmulInt8: dp4mm, bgemm: viaLUT.bgemm, att, fgemm };
-          }
-      }
-      return { backend: "webgpu", label: `${gpuName} (DP4A int8 dot — HW verified vs units)`,
-               matmulInt8: dp4mm, bgemm: bg, att, fgemm };
+      return { backend: "webgpu", label: `${gpuName} (DP4A int8 dot · exact-gated vs units)`,
+               bgemm: bg, att, fgemm };
     } catch (e) { console.warn("WebGPU init failed, CPU fallback:", e); return cpu; }
   }
 
@@ -364,20 +394,6 @@
     return r.out;
   }
 
-  async function gpuMatmulDP4(device, pipeline, Xq, Wq, m, k, n) {
-    const kw = Math.ceil(k / 4);
-    const Xp = packRows(Xq, m, k, kw);
-    const Wp = packRows(transposeI8(Wq, k, n), n, k, kw);   // Wᵀ so col j is a row
-    const bufX = up(device, Xp, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
-    const bufW = up(device, Wp, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
-    const bufD = up(device, new Uint32Array([m, kw, n, 0]), GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
-    const r = await runPass(device, pipeline, (bufC) => [
-      { binding: 0, resource: { buffer: bufX } }, { binding: 1, resource: { buffer: bufW } },
-      { binding: 2, resource: { buffer: bufC } }, { binding: 3, resource: { buffer: bufD } } ], m, n);
-    [bufX, bufW, bufD, r.bufC, r.read].forEach(b => b.destroy());
-    return r.out;
-  }
-
   // attention kernels: int8 (widened i32) in, f32 out, strided head indexing
   async function gpuAttScores(device, pipeline, qq, kq, qs, ks, d) {
     const { B, T, heads } = d;
@@ -389,7 +405,7 @@
     const r = await runBgPass(device, pipeline, (bufO) => [
       { binding: 0, resource: { buffer: bufQ } }, { binding: 1, resource: { buffer: bufK } },
       { binding: 2, resource: { buffer: bufQs } }, { binding: 3, resource: { buffer: bufKs } },
-      { binding: 4, resource: { buffer: bufO } }, { binding: 5, resource: { buffer: bufD } } ], T, T, B * heads);
+      { binding: 4, resource: { buffer: bufO } }, { binding: 5, resource: { buffer: bufD } } ], T, T, B * heads, d.acc);
     [bufQ, bufK, bufQs, bufKs, bufD, r.bufO, r.read].forEach(b => b.destroy());
     return r.out;
   }
@@ -403,7 +419,7 @@
     const r = await runBgPass(device, pipeline, (bufO) => [
       { binding: 0, resource: { buffer: bufA } }, { binding: 1, resource: { buffer: bufV } },
       { binding: 2, resource: { buffer: bufAs } }, { binding: 3, resource: { buffer: bufVs } },
-      { binding: 4, resource: { buffer: bufO } }, { binding: 5, resource: { buffer: bufD } } ], T, hd, B * heads);
+      { binding: 4, resource: { buffer: bufO } }, { binding: 5, resource: { buffer: bufD } } ], T, hd, B * heads, d.acc);
     [bufA, bufV, bufAs, bufVs, bufD, r.bufO, r.read].forEach(b => b.destroy());
     return r.out;
   }
@@ -441,8 +457,9 @@
     return out;
   }
 
-  // fused batched dispatch: f32 out, epilogue done on-device
-  async function runBgPass(device, pipeline, entries, m, n, batch) {
+  // fused batched dispatch: f32 out, epilogue done on-device (raw=true reads the
+  // verify variant's int32 accumulator instead)
+  async function runBgPass(device, pipeline, entries, m, n, batch, raw) {
     const bytesO = batch * m * n * 4;
     const bufO = mk(device, bytesO, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
     const bind = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: entries(bufO) });
@@ -454,7 +471,8 @@
     enc.copyBufferToBuffer(bufO, 0, read, 0, bytesO);
     device.queue.submit([enc.finish()]);
     await read.mapAsync(GPUMapMode.READ);
-    const out = new Float32Array(read.getMappedRange().slice(0));
+    const buf = read.getMappedRange().slice(0);
+    const out = raw ? new Int32Array(buf) : new Float32Array(buf);
     read.unmap();
     return { out, bufO, read };
   }
@@ -470,7 +488,7 @@
       { binding: 0, resource: { buffer: bufX } }, { binding: 1, resource: { buffer: bufW } },
       { binding: 2, resource: { buffer: lutBuf } }, { binding: 3, resource: { buffer: bufR } },
       { binding: 4, resource: { buffer: bufS } }, { binding: 5, resource: { buffer: bufO } },
-      { binding: 6, resource: { buffer: bufD } } ], m, n, batch);
+      { binding: 6, resource: { buffer: bufD } } ], m, n, batch, d.acc);
     [bufX, bufW, bufR, bufS, bufD, r.bufO, r.read].forEach(b => b.destroy());
     return r.out;
   }
@@ -492,7 +510,7 @@
     const r = await runBgPass(device, pipeline, (bufO) => [
       { binding: 0, resource: { buffer: bufX } }, { binding: 1, resource: { buffer: bufW } },
       { binding: 2, resource: { buffer: bufR } }, { binding: 3, resource: { buffer: bufS } },
-      { binding: 4, resource: { buffer: bufO } }, { binding: 5, resource: { buffer: bufD } } ], m, n, batch);
+      { binding: 4, resource: { buffer: bufO } }, { binding: 5, resource: { buffer: bufD } } ], m, n, batch, d.acc);
     [bufX, bufW, bufR, bufS, bufD, r.bufO, r.read].forEach(b => b.destroy());
     return r.out;
   }
@@ -504,5 +522,37 @@
     return b;
   }
 
-  root.Compute = { initCompute, loadLUTs };
+  // ---- canonical kernel probe -------------------------------------------------
+  // The weight hash CANNOT catch a device whose kernel is wrong: weights only
+  // depend on the gradient bytes everyone receives, so a fleet averaging one
+  // device's bad gradient stays bit-identical and perfectly happy. This is the
+  // check that can. Every device runs the SAME seeded int8 GEMM through its own
+  // live kernel (verify variant -> raw int32 accumulator, exact on every
+  // backend — GPU DP4A, GPU LUT, CPU mirror alike) and hashes the result. Same
+  // input + correct kernels => same hash, regardless of hardware. A device that
+  // disagrees is computing different arithmetic than the rest of the fleet.
+  const PROBE = { m: 24, k: 96, n: 24, batch: 2 };
+  function probeInputs() {
+    let seed = 0x5EED;                       // fixed: identical on every device
+    const rnd = () => { seed = (Math.imul(seed, 1103515245) + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+    const { m, k, n, batch } = PROBE;
+    const Xq = new Int8Array(batch * m * k), Wq = new Int8Array(batch * k * n);
+    for (let i = 0; i < Xq.length; i++) Xq[i] = Math.round(rnd() * 254 - 127);
+    for (let i = 0; i < Wq.length; i++) Wq[i] = Math.round(rnd() * 254 - 127);
+    const rs = Float32Array.from({ length: batch * m }, () => 1);
+    const cs = Float32Array.from({ length: batch * n }, () => 1);
+    return { Xq, Wq, rs, cs, d: { ...PROBE, acc: true } };
+  }
+  async function kernelProbe(compute, L) {
+    const { Xq, Wq, rs, cs, d } = probeInputs();
+    const out = compute && compute.bgemm
+      ? await compute.bgemm(Xq, Wq, rs, cs, d)
+      : root.Verified.bgemmJS(Xq, Wq, rs, cs, d, L);
+    let h = 0x811c9dc5;                      // FNV-1a over the exact int32 results
+    const b = new Uint8Array(out.buffer, out.byteOffset, out.byteLength);
+    for (let i = 0; i < b.length; i++) { h ^= b[i]; h = Math.imul(h, 0x01000193); }
+    return h >>> 0;
+  }
+
+  root.Compute = { initCompute, loadLUTs, kernelProbe };
 })(self);

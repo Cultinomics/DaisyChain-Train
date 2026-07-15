@@ -565,18 +565,39 @@ function onFragment(peerId, buf) {               // returns full message when co
   return out.buffer;
 }
 
-// ---- gradient wire format: [int32 step][uint32 whash][f32 loss][f32 grad...]
-// whash = FNV-1a of the sender's weights BEFORE this step's update, so every
-// peer can verify the whole group is still training the same model.
-// loss = the sender's local batch loss, so everyone can show the true
-// cluster-average loss and log what each device contributes.
-function packGrad(step, whash, loss, grad) {
-  const buf = new ArrayBuffer(12 + grad.byteLength);
+// ---- gradient wire: [i32 step][u32 whash][u32 phash][f32 loss][f32 grad...]
+// whash = FNV-1a of the sender's weights BEFORE this step's update — proves the
+//   whole group is still applying the same updates to the same model.
+// phash = FNV-1a of the sender's canonical kernel probe — proves the sender's
+//   arithmetic still agrees with the fleet's. whash CANNOT do this: a device
+//   with a broken kernel broadcasts a bad gradient, everyone averages the same
+//   bad bytes, and every replica stays bit-identical. Replica agreement is not
+//   kernel correctness, so the two hashes check genuinely different things.
+// loss = the sender's local batch loss, for the true cluster-average display.
+function packGrad(step, whash, phash, loss, grad) {
+  const buf = new ArrayBuffer(16 + grad.byteLength);
   new Int32Array(buf, 0, 1)[0] = step;
-  new Uint32Array(buf, 4, 1)[0] = whash;
-  new Float32Array(buf, 8, 1)[0] = loss;
-  new Float32Array(buf, 12).set(grad);
+  new Uint32Array(buf, 4, 2).set([whash, phash]);
+  new Float32Array(buf, 12, 1)[0] = loss;
+  new Float32Array(buf, 16).set(grad);
   return buf;
+}
+// ---- continuous kernel verification ----------------------------------------
+// The boot gate only ever sees toy shapes at one moment. These two keep proving
+// it while the run is live: a random-cell audit against the units at the REAL
+// shapes, and the canonical probe re-run on a cadence so thermal/driver drift
+// shows up mid-run rather than never.
+const PROBE_EVERY = 25;                        // steps between probe refreshes
+let probeHash = 0, auditFailure = null;
+const gemmAudit = {
+  cells: 6,
+  due: () => Math.random() < 0.02,            // ~2% of GEMMs, a few cells each
+  fail: (msg) => { if (!auditFailure) { auditFailure = msg; log(`KERNEL AUDIT FAILED: ${msg}`); } },
+};
+async function refreshProbe() {
+  try { probeHash = await Compute.kernelProbe(compute, L); }
+  catch (e) { log(`kernel probe failed to run: ${e.message}`); }
+  return probeHash;
 }
 function hashWeights() {                        // FNV-1a over the flat param bytes
   const f = Transformer.getFlatParams(model);
@@ -618,16 +639,16 @@ function onGrad(peerId, buf) {
     rosters.set(iv[1], [...iv.slice(3, 3 + iv[2])].map(n => "p" + n));
     wake(); return;
   }
-  const whash = new Uint32Array(buf, 4, 1)[0];
-  const loss = new Float32Array(buf, 8, 1)[0];
-  const grad = new Float32Array(buf.slice(12));
+  const [whash, phash] = new Uint32Array(buf, 4, 2);
+  const loss = new Float32Array(buf, 12, 1)[0];
+  const grad = new Float32Array(buf.slice(16));
   if (!incoming.has(step)) incoming.set(step, new Map());
   incoming.get(step).set(peerId, grad);
   if (!peerHashes.has(step)) peerHashes.set(step, new Map());
-  peerHashes.get(step).set(peerId, { hash: whash, loss });
+  peerHashes.get(step).set(peerId, { hash: whash, phash, loss });
   wake();                                        // resolve waits immediately (no polling)
 }
-function broadcastGrad(step, whash, loss, grad) { return broadcast(packGrad(step, whash, loss, grad)); }
+function broadcastGrad(step, whash, phash, loss, grad) { return broadcast(packGrad(step, whash, phash, loss, grad)); }
 // Event-driven: re-checked on every gradient arrival and peer departure, plus a
 // coarse fallback timer (background tabs throttle timers to ~1s, so the old
 // 15ms poll was the bottleneck there). Peers that left are dropped from the
@@ -680,6 +701,8 @@ async function train(cfg, resume) {
   const opt = TrainCore.makeAdam(model.nParams, { lr: cfg.lr });
   if (resume) opt.setState(resume.adam);               // bit-identical moments from the leader
   pendingJoins.clear();
+  auditFailure = null;
+  await refreshProbe();                                // fresh kernel proof for this run
   log(`training started — cohort ${cohort.length} peer(s), world ${cohort.length + 1}, ` +
       `width=${cfg.c} seq=${cfg.t} batch=${cfg.b}×${cohort.length + 1}, optimizer ${opt.name}` +
       (cohort.length ? `, sync ${iLead ? "led by me" : "led by " + nmeOf(leaderId)}` : "") +
@@ -712,9 +735,14 @@ async function train(cfg, resume) {
       if (lastLocal && lastLocal.s === s) {
         ({ loss, grad } = lastLocal);
       } else {
+        // re-prove this device's kernel against the units on a cadence, so
+        // drift that appears mid-run (thermal, driver, shape) is caught while
+        // it runs rather than only at boot on toy inputs
+        if (s % PROBE_EVERY === 0) await refreshProbe();
         ({ loss, grad } = await localStep());
+        if (auditFailure) { halted = auditFailure; break; }
         lastLocal = { s, loss, grad };
-        await broadcastGrad(s, whash, loss, grad);
+        await broadcastGrad(s, whash, probeHash, loss, grad);
       }
     }
     let all;
@@ -782,6 +810,16 @@ async function train(cfg, resume) {
     if (hs) {
       const bad = roster.find(id => id !== myId && hs.has(id) && hs.get(id).hash !== whash);
       if (bad) { halted = `weights diverged from ${nmeOf(bad)} (detected at step ${s + 1})`; break; }
+      // kernel disagreement: same seeded probe, same exact integer arithmetic
+      // expected on every backend. This is the check the weight hash can't make.
+      const badK = roster.find(id => id !== myId && hs.has(id) && hs.get(id).phash &&
+                                     probeHash && hs.get(id).phash !== probeHash);
+      if (badK) {
+        halted = `kernel disagreement with ${nmeOf(badK)} at step ${s + 1} — their verified-unit probe ` +
+                 `hashes ${hs.get(badK).phash} vs mine ${probeHash}. One of us is computing different ` +
+                 `arithmetic; the shared weights would look fine either way, so stopping.`;
+        break;
+      }
     }
     // cluster-average loss over this step's actual contributors
     let lossSum = 0, lossN = 0;
@@ -842,7 +880,7 @@ function cfgSliders() { return [ui.cfgC, ui.cfgT, ui.cfgB, ui.cfgSteps, ui.cfgLr
 // (re)build the mini transformer — deterministic shared init (same seeds on
 // every peer); each device samples its own batch windows from the shared corpus
 function buildModel(cfg) {
-  model = Transformer.init(cfg, L, compute);       // compute.bgemm = fused batched GPU path
+  model = Transformer.init(cfg, L, compute, gemmAudit);  // compute.bgemm = fused batched GPU path
   trainedSteps = 0;
 }
 
@@ -894,6 +932,11 @@ function buildModel(cfg) {
     return;                                              // no signaling, no training
   }
   ui.backend.textContent = `${compute.backend.toUpperCase()} — ${compute.label} · block-scaled INT8, batched + fused epilogue, through verified units`;
+  // canonical kernel probe: a fixed seeded GEMM through this device's live
+  // kernel. Every device that agrees with the units produces the same number,
+  // GPU or CPU — so it is comparable across the fleet, and re-run mid-training.
+  await refreshProbe();
+  log(`kernel probe: ${probeHash} (exact int32 through the units — every honest device gets this same number)`);
   // tokenizer must load BEFORE the model is built (it sets the vocab size)
   try {
     const name = await Transformer.loadTokenizer();

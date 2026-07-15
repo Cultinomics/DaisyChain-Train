@@ -117,7 +117,8 @@
   // the kernel epilogue (ex. 12). Replaces the per-tensor 3-pass: same outlier
   // robustness at one third of the unit ops.
   async function vmm(Xf, Wf, m, k, n, ctx, relu) {
-    return V.vgemmBlock(Xf, Wf, { m, k, n, batch: 1, relu: !!relu }, ctx.L, ctx.bgemm);
+    // ctx.audit re-checks random cells of this LIVE GEMM against the units
+    return V.vgemmBlock(Xf, Wf, { m, k, n, batch: 1, relu: !!relu }, ctx.L, ctx.bgemm, ctx.audit);
   }
 
   // ---- layernorm (no affine) -------------------------------------------------
@@ -146,7 +147,7 @@
   // cfg: { c: width, t: seq len, b: batch/device, layers, heads, steps, lr }
   // engine: the Compute backend object ({bgemm} for the fused WebGPU path) or a
   // legacy matmulInt8 function (Node tests, inference kit) -> CPU LUT mirror
-  function init(cfg, L, engine) {
+  function init(cfg, L, engine, audit) {
     const c = cfg.c, layers = cfg.layers || 2, heads = cfg.heads || 2, hidden = 2 * c;
     let seed = 100;
     const mk = (nEl, scale) => { const w = randn(nEl, mulberry32(seed++)); for (let i = 0; i < nEl; i++) w[i] *= scale; return w; };
@@ -155,7 +156,8 @@
     const m = {
       cfg: { ...cfg, layers, heads, hidden, vocab: vocabSize() },
       ctx: { L, bgemm: (engine && engine.bgemm) || null,
-             att: (engine && engine.att) || null, fgemm: (engine && engine.fgemm) || null },
+             att: (engine && engine.att) || null, fgemm: (engine && engine.fgemm) || null,
+             audit: audit || null },
       emb: add("emb", mk(vocabSize() * c, 0.08)),
       pos: add("pos", mk(cfg.t * c, 0.02)),
       blocks: [], params, names,
