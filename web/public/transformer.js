@@ -157,7 +157,7 @@
       cfg: { ...cfg, layers, heads, hidden, vocab: vocabSize() },
       ctx: { L, bgemm: (engine && engine.bgemm) || null,
              att: (engine && engine.att) || null, fgemm: (engine && engine.fgemm) || null,
-             audit: audit || null },
+             audit: audit || null, unitBackward: !!cfg.unitBackward },
       emb: add("emb", mk(vocabSize() * c, 0.08)),
       pos: add("pos", mk(cfg.t * c, 0.02)),
       blocks: [], params, names,
@@ -185,19 +185,37 @@
     return { X, Y };
   }
 
-  // per-head slice helpers (q: BT×C row-major; head h occupies cols [h*hd, (h+1)*hd))
-  function headSlice(q, bIdx, h, T, C, hd) {
-    const out = new Float32Array(T * hd);
-    for (let ti = 0; ti < T; ti++)
-      for (let j = 0; j < hd; j++) out[ti * hd + j] = q[(bIdx * T + ti) * C + h * hd + j];
+  // ---- head layout helpers ---------------------------------------------------
+  // q/k/v live as BT×C with head h owning columns [h*hd, (h+1)*hd). The backward
+  // wants every head as its own GEMM problem, so gather once into BH×T×hd and
+  // scatter back at the end — one pass each, instead of slicing per head inside
+  // the loop and paying a GPU dispatch per tiny matmul.
+  function gatherHeads(x, B, T, C, heads, hd) {          // BT×C -> BH×T×hd
+    const out = new Float32Array(B * heads * T * hd);
+    for (let bi = 0; bi < B; bi++)
+      for (let h = 0; h < heads; h++) {
+        const bz = bi * heads + h;
+        for (let ti = 0; ti < T; ti++)
+          for (let j = 0; j < hd; j++) out[(bz * T + ti) * hd + j] = x[(bi * T + ti) * C + h * hd + j];
+      }
     return out;
   }
-  function headUnslice(dst, src, bIdx, h, T, C, hd, accumulate) {
-    for (let ti = 0; ti < T; ti++)
-      for (let j = 0; j < hd; j++) {
-        const di = (bIdx * T + ti) * C + h * hd + j;
-        dst[di] = (accumulate ? dst[di] : 0) + src[ti * hd + j];
+  function scatterHeadsAcc(dst, src, B, T, C, heads, hd) {   // BH×T×hd -> += BT×C
+    for (let bi = 0; bi < B; bi++)
+      for (let h = 0; h < heads; h++) {
+        const bz = bi * heads + h;
+        for (let ti = 0; ti < T; ti++)
+          for (let j = 0; j < hd; j++) dst[(bi * T + ti) * C + h * hd + j] += src[(bz * T + ti) * hd + j];
       }
+  }
+  function batchedTranspose(x, batch, rows, cols) {      // per-batch rows×cols -> cols×rows
+    const out = new Float32Array(batch * rows * cols);
+    for (let b = 0; b < batch; b++) {
+      const o = b * rows * cols;
+      for (let r = 0; r < rows; r++)
+        for (let c = 0; c < cols; c++) out[o + c * rows + r] = x[o + r * cols + c];
+    }
+    return out;
   }
 
   // ---- forward THROUGH the verified units (caches kept for STE backward) -----
@@ -283,20 +301,42 @@
   // available (CUTLASS ex. 06) — same float math, off the JS thread.
   async function backward(m, cache) {
     const { c: C, t: T, b: B, layers, heads, hidden, vocab } = m.cfg;
-    const BT = B * T, hd = C / heads, mm = TC.matmul, tr = TC.transpose;
+    const BT = B * T, hd = C / heads, tr = TC.transpose;
     const g = m.params.map(p => new Float32Array(p.length));
     const gi = Object.fromEntries(m.names.map((n, i) => [n, i]));
+    // Every matmul here goes through `bmm`. With ctx.unitBackward the STE
+    // gradient is computed BY the verified units (block-scaled int8, exact int32
+    // accumulate) instead of in float. STE is a claim about the math — pretend
+    // the quantizer was the identity — not about the datatype that evaluates it,
+    // so the two are orthogonal and this stays a correct STE.
+    const units = !!m.ctx.unitBackward;
+    const bmm = units
+      ? (A, Bm, mm_, k, n) => vmm(A, Bm, mm_, k, n, m.ctx)
+      : async (A, Bm, mm_, k, n) => TC.matmul(A, Bm, mm_, k, n);
+    // batched: all `batch` problems in ONE dispatch (CUTLASS ex. 05/24). The
+    // per-head backward is 4 GEMMs x B x heads of tiny matrices; issued one at a
+    // time the GPU spends all its time on dispatch overhead rather than math.
+    const bmmB = units
+      ? (A, Bm, rows, k, n, batch) =>
+          V.vgemmBlock(A, Bm, { m: rows, k, n, batch }, m.ctx.L, m.ctx.bgemm, m.ctx.audit)
+      : async (A, Bm, rows, k, n, batch) => {
+          const out = new Float32Array(batch * rows * n);
+          for (let bz = 0; bz < batch; bz++)
+            out.set(TC.matmul(A.subarray(bz * rows * k, (bz + 1) * rows * k),
+                              Bm.subarray(bz * k * n, (bz + 1) * k * n), rows, k, n), bz * rows * n);
+          return out;
+        };
     // tied unembed: logits = lnf @ embᵀ, so the unembedding gradient flows
     // straight into emb — dlogitsᵀ @ lnf is V×C, emb's own shape
     let dlnfIn;
-    if (m.ctx.fgemm) {
+    if (m.ctx.fgemm && !units) {
       [g[gi.emb], dlnfIn] = await Promise.all([
         m.ctx.fgemm(cache.dlogits, cache.lnf.y, { m: vocab, k: BT, n: C, transA: true }),
         m.ctx.fgemm(cache.dlogits, m.emb, { m: BT, k: vocab, n: C }),      // split-K shape
       ]);
     } else {
-      g[gi.emb] = mm(tr(cache.dlogits, BT, vocab), cache.lnf.y, vocab, BT, C);
-      dlnfIn = mm(cache.dlogits, m.emb, BT, vocab, C);
+      g[gi.emb] = await bmm(tr(cache.dlogits, BT, vocab), cache.lnf.y, vocab, BT, C);
+      dlnfIn = await bmm(cache.dlogits, m.emb, BT, vocab, C);
     }
     let dx = lnBwd(dlnfIn, cache.lnf.y, cache.lnf.sig, BT, C);
     const scale = 1 / Math.sqrt(hd);
@@ -304,44 +344,52 @@
       const bl = m.blocks[l], cb = cache.blocks[l];
       // mlp: x3 = x2 + relu(ln2 @ W1) @ W2
       const dmlpOut = dx;                              // residual passthrough handled below
-      g[gi[`b${l}.W2`]] = mm(tr(cb.h1, BT, hidden), dmlpOut, hidden, BT, C);
-      const dh1 = mm(dmlpOut, tr(bl.W2, hidden, C), BT, C, hidden);
+      g[gi[`b${l}.W2`]] = await bmm(tr(cb.h1, BT, hidden), dmlpOut, hidden, BT, C);
+      const dh1 = await bmm(dmlpOut, tr(bl.W2, hidden, C), BT, C, hidden);
       for (let i = 0; i < dh1.length; i++) if (!cb.mask[i]) dh1[i] = 0;
-      g[gi[`b${l}.W1`]] = mm(tr(cb.ln2.y, BT, C), dh1, C, BT, hidden);
-      const dln2in = lnBwd(mm(dh1, tr(bl.W1, C, hidden), BT, hidden, C), cb.ln2.y, cb.ln2.sig, BT, C);
+      g[gi[`b${l}.W1`]] = await bmm(tr(cb.ln2.y, BT, C), dh1, C, BT, hidden);
+      const dln2in = lnBwd(await bmm(dh1, tr(bl.W1, C, hidden), BT, hidden, C), cb.ln2.y, cb.ln2.sig, BT, C);
       const dx2 = new Float32Array(BT * C);
       for (let i = 0; i < dx2.length; i++) dx2[i] = dx[i] + dln2in[i];
       // attention: x2 = xin + (ctxOut @ Wo)
-      g[gi[`b${l}.Wo`]] = mm(tr(cb.ctxOut, BT, C), dx2, C, BT, C);
-      const dctx = mm(dx2, tr(bl.Wo, C, C), BT, C, C);
-      const dq = new Float32Array(BT * C), dk = new Float32Array(BT * C), dv = new Float32Array(BT * C);
-      for (let bi = 0; bi < B; bi++) for (let h = 0; h < heads; h++) {
-        const bz = bi * heads + h;
-        const a = cb.aAll.subarray(bz * T * T, (bz + 1) * T * T);
-        const qh = headSlice(cb.q, bi, h, T, C, hd);
-        const kh = headSlice(cb.k, bi, h, T, C, hd);
-        const vh = headSlice(cb.v, bi, h, T, C, hd);
-        const dch = headSlice(dctx, bi, h, T, C, hd);        // T×hd
-        const dvh = mm(tr(a, T, T), dch, T, T, hd);          // aᵀ @ dctx
-        const da = mm(dch, tr(vh, T, hd), T, hd, T);         // dctx @ vᵀ
-        const ds = new Float32Array(T * T);                  // softmax bwd (causal)
+      g[gi[`b${l}.Wo`]] = await bmm(tr(cb.ctxOut, BT, C), dx2, C, BT, C);
+      const dctx = await bmm(dx2, tr(bl.Wo, C, C), BT, C, C);
+      // gather every head once, then run each stage as ONE batched GEMM over all
+      // B*heads problems: 4 dispatches per layer instead of 4 per head.
+      const BH = B * heads;
+      const qb = gatherHeads(cb.q, B, T, C, heads, hd);
+      const kb = gatherHeads(cb.k, B, T, C, heads, hd);
+      const vb = gatherHeads(cb.v, B, T, C, heads, hd);
+      const dchb = gatherHeads(dctx, B, T, C, heads, hd);
+      const aT = batchedTranspose(cb.aAll, BH, T, T);        // BH×T×T
+      const vT = batchedTranspose(vb, BH, T, hd);            // BH×hd×T
+      const dvAll = await bmmB(aT, dchb, T, T, hd, BH);      // aᵀ @ dctx
+      const daAll = await bmmB(dchb, vT, T, hd, T, BH);      // dctx @ vᵀ
+      // softmax backward is elementwise + a causal row reduction: stays in float
+      // (no matrix math here, so nothing for the units to do)
+      const dsAll = new Float32Array(BH * T * T);
+      for (let bz = 0; bz < BH; bz++) {
+        const o = bz * T * T;
         for (let ti = 0; ti < T; ti++) {
           let dot = 0;
-          for (let tj = 0; tj <= ti; tj++) dot += da[ti * T + tj] * a[ti * T + tj];
-          for (let tj = 0; tj <= ti; tj++) ds[ti * T + tj] = a[ti * T + tj] * (da[ti * T + tj] - dot) * scale;
+          for (let tj = 0; tj <= ti; tj++) dot += daAll[o + ti * T + tj] * cb.aAll[o + ti * T + tj];
+          for (let tj = 0; tj <= ti; tj++)
+            dsAll[o + ti * T + tj] = cb.aAll[o + ti * T + tj] * (daAll[o + ti * T + tj] - dot) * scale;
         }
-        const dqh = mm(ds, kh, T, T, hd);                    // ds @ k
-        const dkh = mm(tr(ds, T, T), qh, T, T, hd);          // dsᵀ @ q
-        headUnslice(dq, dqh, bi, h, T, C, hd, true);
-        headUnslice(dk, dkh, bi, h, T, C, hd, true);
-        headUnslice(dv, dvh, bi, h, T, C, hd, true);
       }
-      g[gi[`b${l}.Wq`]] = mm(tr(cb.ln1.y, BT, C), dq, C, BT, C);
-      g[gi[`b${l}.Wk`]] = mm(tr(cb.ln1.y, BT, C), dk, C, BT, C);
-      g[gi[`b${l}.Wv`]] = mm(tr(cb.ln1.y, BT, C), dv, C, BT, C);
+      const dsT = batchedTranspose(dsAll, BH, T, T);
+      const dqAll = await bmmB(dsAll, kb, T, T, hd, BH);     // ds @ k
+      const dkAll = await bmmB(dsT, qb, T, T, hd, BH);       // dsᵀ @ q
+      const dq = new Float32Array(BT * C), dk = new Float32Array(BT * C), dv = new Float32Array(BT * C);
+      scatterHeadsAcc(dq, dqAll, B, T, C, heads, hd);
+      scatterHeadsAcc(dk, dkAll, B, T, C, heads, hd);
+      scatterHeadsAcc(dv, dvAll, B, T, C, heads, hd);
+      g[gi[`b${l}.Wq`]] = await bmm(tr(cb.ln1.y, BT, C), dq, C, BT, C);
+      g[gi[`b${l}.Wk`]] = await bmm(tr(cb.ln1.y, BT, C), dk, C, BT, C);
+      g[gi[`b${l}.Wv`]] = await bmm(tr(cb.ln1.y, BT, C), dv, C, BT, C);
       const dln1in = new Float32Array(BT * C);
-      const addIn = (dsrc, W) => { const t2 = mm(dsrc, tr(W, C, C), BT, C, C); for (let i = 0; i < dln1in.length; i++) dln1in[i] += t2[i]; };
-      addIn(dq, bl.Wq); addIn(dk, bl.Wk); addIn(dv, bl.Wv);
+      const addIn = async (dsrc, W) => { const t2 = await bmm(dsrc, tr(W, C, C), BT, C, C); for (let i = 0; i < dln1in.length; i++) dln1in[i] += t2[i]; };
+      await addIn(dq, bl.Wq); await addIn(dk, bl.Wk); await addIn(dv, bl.Wv);
       const dxin = lnBwd(dln1in, cb.ln1.y, cb.ln1.sig, BT, C);
       dx = new Float32Array(BT * C);
       for (let i = 0; i < dx.length; i++) dx[i] = dx2[i] + dxin[i];
