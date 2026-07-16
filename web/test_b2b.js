@@ -61,6 +61,9 @@ const ok = (c, msg) => { console.log(`${c ? "  ok  " : "  FAIL"}  ${msg}`); if (
       }
     }
     ok(maxd <= 1, `respecced quantize differs by at most 1 step (max ${maxd}; ${diff}/${n} = ${(100 * diff / n).toFixed(3)}% of values moved)`);
+    // and it must differ SOMEWHERE: if the respec silently became the old
+    // spec, every "bit-identical to the mirror" claim downstream is untested
+    ok(diff > 0, `the respec is a real change (${diff} boundary values moved) — the mirror equivalence is not vacuous`);
   }
   // 3) chain == its parts, and gemm1 is byte-identical to the un-chained GEMM
   {

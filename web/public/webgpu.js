@@ -416,6 +416,35 @@
           for (let i = 0; i < ref.out.length; i++)
             if (hw.out[i] !== ref.out[i]) return `out mismatch @${i} (${shape}): ${hw.out[i]} vs ${ref.out[i]}`;
         }
+        // DISCRIMINATING case: the sweep above passes vacuously if no value
+        // lands on a rounding boundary — the old round(x/scale) spec would
+        // pass it too. So hunt (in fast JS) for an input where the two specs
+        // actually disagree, then check the GPU sides with the RESPEC. This
+        // gates the gate: a pass must be something the old spec would fail.
+        const V = root.Verified;
+        const d1 = { m: 16, k: 32, h: 64, n: 16 };
+        const rnd1 = (len) => Float32Array.from({ length: len }, () => Math.random() * 4 - 2);
+        for (let t = 0; t < 800; t++) {
+          const Xf = rnd1(d1.m * d1.k), W1 = rnd1(d1.k * d1.h), W2 = rnd1(d1.h * d1.n);
+          const x = V.quantizeRows(Xf, d1.m, d1.k), w1 = V.quantizeCols(W1, d1.k, d1.h);
+          const h1 = V.bgemmJS(x.q, w1.q, x.s, w1.s, { m: d1.m, k: d1.k, n: d1.h, batch: 1, relu: true }, L);
+          const sc = V.scalesFromAbsMax(V.rowAbsMax(h1, d1.m, d1.h));
+          const qNew = V.quantizeRowsInv(h1, d1.m, d1.h, sc.inv);
+          const qOld = V.quantizeRows(h1, d1.m, d1.h).q;
+          let boundary = false;
+          for (let i = 0; i < qNew.length; i++) if (qNew[i] !== qOld[i]) { boundary = true; break; }
+          if (!boundary) continue;
+          const w2 = V.quantizeCols(W2, d1.h, d1.n);
+          const gpu = await mlpFn(x.q, w1.q, w2.q, x.s, w1.s, w2.s, d1);
+          const refNew = V.bgemmJS(qNew, w2.q, sc.scale, w2.s, { m: d1.m, k: d1.h, n: d1.n, batch: 1 }, L);
+          const refOld = V.bgemmJS(qOld, w2.q, sc.scale, w2.s, { m: d1.m, k: d1.h, n: d1.n, batch: 1 }, L);
+          let eqNew = true, eqOld = true;
+          for (let i = 0; i < refNew.length; i++) { if (gpu.out[i] !== refNew[i]) eqNew = false; if (gpu.out[i] !== refOld[i]) eqOld = false; }
+          if (!eqNew) return "discriminating boundary case: GPU chain does not match the respec mirror";
+          if (eqOld) return "discriminating boundary case: GPU chain matches the OLD quantize spec";
+          return null;                                    // proven: respec, not merely gate-compatible
+        }
+        console.warn("B2B gate: no rounding-boundary input found in 800 trials — respec discrimination unproven this boot (sweep still exact)");
         return null;
       }
       const lutMlpEnv = { dp4: false, gemm: bgLutPipe, rowmax: rowmaxPipe, quant: quantI32Pipe, lutBuf };
