@@ -116,6 +116,35 @@
     // ctx.audit re-checks random cells of this LIVE GEMM against the units
     return V.vgemmBlock(Xf, Wf, { m, k, n, batch: 1, relu: !!relu }, ctx.L, ctx.bgemm, ctx.audit);
   }
+  // CUTLASS ex. 45 (dual GEMM): sibling GEMMs that share the same LEFT operand
+  // run as ONE batched dispatch, and the shared operand is quantized ONCE
+  // instead of once per sibling. Used for the q/k/v projections — same X
+  // (ln1.y), three weights, identical shapes. Bit-identical to three separate
+  // vmm calls: quantizeRows is deterministic (same input -> same int8+scales),
+  // the tiled copies index exactly like separate batch elements, and block
+  // scales are per-row/per-column PER BATCH ELEMENT, so concatenation changes
+  // no scale and no product. The batched kernel is the same exact-gated bgemm
+  // that training already runs, and the live-shape audit still samples it.
+  async function vmmShared3(Xf, Wa, Wb, Wc, m, k, n, ctx) {
+    const x = V.quantizeRows(Xf, m, k);
+    const xq = new Int8Array(3 * m * k), xs = new Float32Array(3 * m);
+    for (let i = 0; i < 3; i++) { xq.set(x.q, i * m * k); xs.set(x.s, i * m); }
+    const wq = new Int8Array(3 * k * n), ws = new Float32Array(3 * n);
+    [Wa, Wb, Wc].forEach((W, i) => { const w = V.quantizeCols(W, k, n); wq.set(w.q, i * k * n); ws.set(w.s, i * n); });
+    const d = { m, k, n, batch: 3 };
+    let out;
+    if (ctx.bgemm) {
+      out = await ctx.bgemm(xq, wq, xs, ws, d);
+      if (ctx.audit && ctx.audit.due()) {
+        const bad = V.auditTile(xq, wq, xs, ws, d, out, ctx.L, ctx.audit.cells);
+        if (bad) ctx.audit.fail(bad);
+      }
+    } else {
+      out = V.bgemmJS(xq, wq, xs, ws, d, ctx.L);
+    }
+    const MN = m * n;
+    return [out.subarray(0, MN), out.subarray(MN, 2 * MN), out.subarray(2 * MN, 3 * MN)];
+  }
 
   // ---- layernorm (no affine) -------------------------------------------------
   function lnFwd(x, rows, C) {
@@ -227,9 +256,9 @@
     for (let l = 0; l < layers; l++) {
       const bl = m.blocks[l], cb = { xin: x };
       const l1 = lnFwd(x, BT, C); cb.ln1 = l1;
-      const q = await vmm(l1.y, bl.Wq, BT, C, C, ctx);
-      const k = await vmm(l1.y, bl.Wk, BT, C, C, ctx);
-      const v = await vmm(l1.y, bl.Wv, BT, C, C, ctx);
+      // q/k/v share the same left operand — one batched dispatch, one quantize
+      // of ln1.y instead of three (CUTLASS ex. 45; see vmmShared3)
+      const [q, k, v] = await vmmShared3(l1.y, bl.Wq, bl.Wk, bl.Wv, BT, C, C, ctx);
       cb.q = q; cb.k = k; cb.v = v;
       const scale = 1 / Math.sqrt(hd);
       // gather-FUSED attention (CUTLASS ex. 36/52): the kernels read q/k/v in
