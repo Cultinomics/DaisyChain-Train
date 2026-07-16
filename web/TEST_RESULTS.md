@@ -85,6 +85,29 @@ gradient FNV hash compared old vs new on-device):
   rate moved. At equal wall clock float still wins (~1.5% at the 200-step
   horizon), so `unitBackward` stays off by default.
 
+## QKV dual-GEMM fusion (CUTLASS ex. 45)
+
+The q/k/v projections share the same left operand (`ln1.y`), so the forward
+now quantizes it ONCE and runs all three as one batched (batch=3) dispatch —
+2 fewer dispatches and 2 fewer full quantize passes per layer per step.
+
+Bit-identity (old three-GEMM forward vs fused), 5 full training steps with
+weight updates in between so a single-ulp divergence anywhere compounds:
+
+```
+char-96,        float backward: 5 losses + 5×20480  grads + final weights bit-identical
+char-96,        unit  backward: 5 losses + 5×20480  grads + final weights bit-identical
+Spikewhale 16k, float backward: 5 losses + 5×545792 grads + final weights bit-identical
+Spikewhale 16k, unit  backward: 5 losses + 5×545792 grads + final weights bit-identical
+generate() output identical (the fused output's subarray views feed attention)
+```
+
+On GPU (DP4A): gradient FNV hashes match the pre-fusion values exactly in
+both modes (`7ff11308` float / `62596547` units); ~2% wall-clock gain at
+width 32 (the shared operand is only 32 KB there — the saved quantize work
+scales quadratically with model width). Two-device live run: both replicas
+at step 71/300 with identical loss to the last digit, no sync-guard trips.
+
 One bug was caught during the rework, by the bit-identity check itself: the
 fused q+k+v sum initially ran in f64 and rounded once, where the old code
 rounded to f32 after each add — a last-ulp fork that would have split
