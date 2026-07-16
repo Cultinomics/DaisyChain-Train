@@ -87,28 +87,24 @@
   let IDS = encode(CORPUS);
   let DATASET = "built-in corpus";
 
-  // Stream real training text from any public HuggingFace dataset with a
-  // `text` column, via the datasets-server rows API. Each device pulls its own
-  // random slice (that's data parallelism — batches were always per-device
-  // anyway). Offline or on API failure the built-in corpus stays in place.
+  // Training text: FineWeb-Edu (10BT sample), HARDCODED as the only dataset.
+  // The serving Space reads random slices of the parquet shards straight off
+  // the HF CDN with range requests (see server.js /data) — no dependency on
+  // the datasets-server rows API, which 503s routinely. Each device pulls its
+  // own random slice (that's data parallelism — batches were always
+  // per-device anyway). Offline or on failure the built-in corpus stays.
   const DEFAULT_DS = "HuggingFaceFW/fineweb-edu";
-  async function streamDataset(ds) {
-    ds = (ds || DEFAULT_DS).trim();
-    if (!/^[\w.-]+\/[\w.-]+$/.test(ds)) throw new Error(`invalid dataset id "${ds}"`);
-    const offset = Math.floor(Math.random() * 9900);
-    const url = `https://datasets-server.huggingface.co/rows?dataset=${encodeURIComponent(ds)}` +
-                `&config=default&split=train&offset=${offset}&length=100`;
-    const r = await fetch(url);
-    if (!r.ok) throw new Error(`datasets-server HTTP ${r.status}`);
-    const j = await r.json();
-    const text = j.rows.map(x => String(x.row.text ?? "")).join("\n").replace(/[^\x20-\x7e\n]/g, " ");
-    if (text.length < 10000) throw new Error("too little text returned (does the dataset have a `text` column?)");
+  async function streamDataset() {              // dataset choice removed on purpose
+    const r = await fetch("data");
+    if (!r.ok) throw new Error(`/data HTTP ${r.status}`);
+    const text = (await r.text()).replace(/[^\x20-\x7e\n]/g, " ");
+    if (text.length < 10000) throw new Error("too little text returned");
     CORPUS = text.slice(0, 500000);
     IDS = encode(CORPUS);
-    DATASET = `${ds} (streamed)`;
+    DATASET = `${DEFAULT_DS} · 10BT sample (parquet via this Space)`;
     return { name: DATASET, chars: CORPUS.length };
   }
-  const streamFineWebEdu = () => streamDataset(DEFAULT_DS);
+  const streamFineWebEdu = () => streamDataset();
   function datasetName() { return DATASET; }
 
   // ---- verified matmul: block-scaled INT8 through the units ------------------
@@ -334,26 +330,82 @@
         m.ctx.fgemm(cache.dlogits, cache.lnf.y, { m: vocab, k: BT, n: C, transA: true }),
         m.ctx.fgemm(cache.dlogits, m.emb, { m: BT, k: vocab, n: C }),      // split-K shape
       ]);
+    } else if (units && m.ctx.bgemm) {
+      // units + GPU: the g.emb operand is dlogitsᵀ (vocab×BT, ~4M elements), and
+      // tr() + quantizeRows() is three full passes over it in JS. Quantizing the
+      // COLUMNS of dlogits directly into transposed int8 is one pass and
+      // bit-identical: same |max| scan, same rounds, in the same order — only
+      // the write pattern changes. The GEMM itself still goes through ctx.bgemm
+      // (exact-gated), and the live-shape audit still samples it.
+      const quantizeColsAsRows = (X, rows, cols) => {   // == quantizeRows(tr(X), cols, rows)
+        const q = new Int8Array(cols * rows), s = new Float32Array(cols);
+        for (let c = 0; c < cols; c++) {
+          let mx = 0;
+          for (let r = 0; r < rows; r++) { const a = Math.abs(X[r * cols + c]); if (a > mx) mx = a; }
+          const sc = Math.max(mx / 127, 1e-8); s[c] = sc;
+          for (let r = 0; r < rows; r++) {
+            const v = Math.round(X[r * cols + c] / sc);
+            q[c * rows + r] = v < -128 ? -128 : v > 127 ? 127 : v;
+          }
+        }
+        return { q, s };
+      };
+      const dlq = quantizeColsAsRows(cache.dlogits, BT, vocab);   // dlogitsᵀ quantized, one pass
+      const wq2 = V.quantizeCols(cache.lnf.y, BT, C);
+      const dEmb = { m: vocab, k: BT, n: C, batch: 1 };
+      const [gEmb, dIn] = await Promise.all([
+        m.ctx.bgemm(dlq.q, wq2.q, dlq.s, wq2.s, dEmb),
+        bmm(cache.dlogits, m.emb, BT, vocab, C),
+      ]);
+      if (m.ctx.audit && m.ctx.audit.due()) {
+        const bad = V.auditTile(dlq.q, wq2.q, dlq.s, wq2.s, dEmb, gEmb, m.ctx.L, m.ctx.audit.cells);
+        if (bad) m.ctx.audit.fail(bad);
+      }
+      g[gi.emb] = gEmb; dlnfIn = dIn;
     } else {
-      g[gi.emb] = await bmm(tr(cache.dlogits, BT, vocab), cache.lnf.y, vocab, BT, C);
-      dlnfIn = await bmm(cache.dlogits, m.emb, BT, vocab, C);
+      // independent GEMMs — overlap them (these are the two vocab-sized calls,
+      // the largest in the whole backward; each is its own round trip)
+      [g[gi.emb], dlnfIn] = await Promise.all([
+        bmm(tr(cache.dlogits, BT, vocab), cache.lnf.y, vocab, BT, C),
+        bmm(cache.dlogits, m.emb, BT, vocab, C),
+      ]);
     }
     let dx = lnBwd(dlnfIn, cache.lnf.y, cache.lnf.sig, BT, C);
     const scale = 1 / Math.sqrt(hd);
+    // concat helper for fusing sibling GEMMs into one batched dispatch
+    const cat = (...arrs) => {
+      const out = new Float32Array(arrs.reduce((a, x) => a + x.length, 0));
+      let o = 0; for (const x of arrs) { out.set(x, o); o += x.length; }
+      return out;
+    };
     for (let l = layers - 1; l >= 0; l--) {
       const bl = m.blocks[l], cb = cache.blocks[l];
       // mlp: x3 = x2 + relu(ln2 @ W1) @ W2
+      // gW2 and dh1 are independent — overlap their dispatches. On GPU each bmm
+      // is a full upload/submit/readback round trip, so sequential awaits leave
+      // the GPU idle between every pair; this is pure latency, not arithmetic,
+      // and each GEMM's int32 accumulation is exact so overlap changes no bit.
       const dmlpOut = dx;                              // residual passthrough handled below
-      g[gi[`b${l}.W2`]] = await bmm(tr(cb.h1, BT, hidden), dmlpOut, hidden, BT, C);
-      const dh1 = await bmm(dmlpOut, tr(bl.W2, hidden, C), BT, C, hidden);
+      const [gW2, dh1] = await Promise.all([
+        bmm(tr(cb.h1, BT, hidden), dmlpOut, hidden, BT, C),
+        bmm(dmlpOut, tr(bl.W2, hidden, C), BT, C, hidden),
+      ]);
+      g[gi[`b${l}.W2`]] = gW2;
       for (let i = 0; i < dh1.length; i++) if (!cb.mask[i]) dh1[i] = 0;
-      g[gi[`b${l}.W1`]] = await bmm(tr(cb.ln2.y, BT, C), dh1, C, BT, hidden);
-      const dln2in = lnBwd(await bmm(dh1, tr(bl.W1, C, hidden), BT, hidden, C), cb.ln2.y, cb.ln2.sig, BT, C);
+      const [gW1, dln2raw] = await Promise.all([
+        bmm(tr(cb.ln2.y, BT, C), dh1, C, BT, hidden),
+        bmm(dh1, tr(bl.W1, C, hidden), BT, hidden, C),
+      ]);
+      g[gi[`b${l}.W1`]] = gW1;
+      const dln2in = lnBwd(dln2raw, cb.ln2.y, cb.ln2.sig, BT, C);
       const dx2 = new Float32Array(BT * C);
       for (let i = 0; i < dx2.length; i++) dx2[i] = dx[i] + dln2in[i];
       // attention: x2 = xin + (ctxOut @ Wo)
-      g[gi[`b${l}.Wo`]] = await bmm(tr(cb.ctxOut, BT, C), dx2, C, BT, C);
-      const dctx = await bmm(dx2, tr(bl.Wo, C, C), BT, C, C);
+      const [gWo, dctx] = await Promise.all([
+        bmm(tr(cb.ctxOut, BT, C), dx2, C, BT, C),
+        bmm(dx2, tr(bl.Wo, C, C), BT, C, C),
+      ]);
+      g[gi[`b${l}.Wo`]] = gWo;
       // gather every head once, then run each stage as ONE batched GEMM over all
       // B*heads problems: 4 dispatches per layer instead of 4 per head.
       const BH = B * heads;
@@ -363,8 +415,10 @@
       const dchb = gatherHeads(dctx, B, T, C, heads, hd);
       const aT = batchedTranspose(cb.aAll, BH, T, T);        // BH×T×T
       const vT = batchedTranspose(vb, BH, T, hd);            // BH×hd×T
-      const dvAll = await bmmB(aT, dchb, T, T, hd, BH);      // aᵀ @ dctx
-      const daAll = await bmmB(dchb, vT, T, hd, T, BH);      // dctx @ vᵀ
+      const [dvAll, daAll] = await Promise.all([
+        bmmB(aT, dchb, T, T, hd, BH),                        // aᵀ @ dctx
+        bmmB(dchb, vT, T, hd, T, BH),                        // dctx @ vᵀ
+      ]);
       // softmax backward is elementwise + a causal row reduction: stays in float
       // (no matrix math here, so nothing for the units to do)
       const dsAll = new Float32Array(BH * T * T);
@@ -378,18 +432,36 @@
         }
       }
       const dsT = batchedTranspose(dsAll, BH, T, T);
-      const dqAll = await bmmB(dsAll, kb, T, T, hd, BH);     // ds @ k
-      const dkAll = await bmmB(dsT, qb, T, T, hd, BH);       // dsᵀ @ q
+      const [dqAll, dkAll] = await Promise.all([
+        bmmB(dsAll, kb, T, T, hd, BH),                       // ds @ k
+        bmmB(dsT, qb, T, T, hd, BH),                         // dsᵀ @ q
+      ]);
       const dq = new Float32Array(BT * C), dk = new Float32Array(BT * C), dv = new Float32Array(BT * C);
       scatterHeadsAcc(dq, dqAll, B, T, C, heads, hd);
       scatterHeadsAcc(dk, dkAll, B, T, C, heads, hd);
       scatterHeadsAcc(dv, dvAll, B, T, C, heads, hd);
-      g[gi[`b${l}.Wq`]] = await bmm(tr(cb.ln1.y, BT, C), dq, C, BT, C);
-      g[gi[`b${l}.Wk`]] = await bmm(tr(cb.ln1.y, BT, C), dk, C, BT, C);
-      g[gi[`b${l}.Wv`]] = await bmm(tr(cb.ln1.y, BT, C), dv, C, BT, C);
-      const dln1in = new Float32Array(BT * C);
-      const addIn = async (dsrc, W) => { const t2 = await bmm(dsrc, tr(W, C, C), BT, C, C); for (let i = 0; i < dln1in.length; i++) dln1in[i] += t2[i]; };
-      await addIn(dq, bl.Wq); await addIn(dk, bl.Wk); await addIn(dv, bl.Wv);
+      // The QKV weight grads share the same left operand (ln1ᵀ), and the three
+      // dln1in terms share one shape — each trio fuses into ONE batched GEMM
+      // (batch=3) instead of three dispatches. Bit-identical to separate calls:
+      // block scales are per-row of X and per-column of W PER BATCH ELEMENT, so
+      // concatenation changes no scale and no product.
+      const ln1T = tr(cb.ln1.y, BT, C);
+      const [gQKV, dIn3] = await Promise.all([
+        bmmB(cat(ln1T, ln1T, ln1T), cat(dq, dk, dv), C, BT, C, 3),
+        bmmB(cat(dq, dk, dv), cat(tr(bl.Wq, C, C), tr(bl.Wk, C, C), tr(bl.Wv, C, C)), BT, C, C, 3),
+      ]);
+      const CC = C * C, BTC = BT * C;
+      g[gi[`b${l}.Wq`]] = gQKV.slice(0, CC);
+      g[gi[`b${l}.Wk`]] = gQKV.slice(CC, 2 * CC);
+      g[gi[`b${l}.Wv`]] = gQKV.slice(2 * CC, 3 * CC);
+      // sum the three dln1in terms in q,k,v order with an f32 round after EACH
+      // add — the old code accumulated into a Float32Array element three times,
+      // which rounds per step; a bare q+k+v here would run in f64 and round
+      // once, a last-ulp difference that forks replicas. (Exactly the epilogue
+      // mirror lesson: match the rounding schedule, not just the values.)
+      const dln1in = new Float32Array(BTC);
+      for (let i = 0; i < BTC; i++)
+        dln1in[i] = Math.fround(Math.fround(dIn3[i] + dIn3[BTC + i]) + dIn3[2 * BTC + i]);
       const dxin = lnBwd(dln1in, cb.ln1.y, cb.ln1.sig, BT, C);
       dx = new Float32Array(BT * C);
       for (let i = 0; i < dx.length; i++) dx[i] = dx2[i] + dxin[i];

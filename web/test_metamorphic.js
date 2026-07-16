@@ -24,6 +24,16 @@ const randf = (n, f) => Float32Array.from({ length: n }, f || (() => Math.random
 function makeKernel(bug) {
   return async (Xf, Wf, d) => {
     const { m, k, n } = d, batch = d.batch || 1;
+    if (bug === "accOverwrite") {                 // corpus: matmul_triton_buggy
+      const q = V.quantizeRows(Xf, batch * m, k), w = V.quantizeCols(Wf, k, n);
+      const out = d.acc ? new Int32Array(batch * m * n) : new Float32Array(batch * m * n);
+      for (let i = 0; i < m; i++) for (let j = 0; j < n; j++) {
+        let a = 0;
+        for (let p = 0; p < k; p++) a = L.mul[(q.q[i * k + p] & 0xFF) * 256 + (w.q[p * n + j] & 0xFF)];
+        out[i * n + j] = d.acc ? a : V.epi(a, q.s[i], w.s[j]);
+      }
+      return out;
+    }
     const x = V.quantizeRows(Xf, batch * m, k);
     let wq, ws;
     if (batch === 1) { const w = V.quantizeCols(Wf, k, n); wq = w.q; ws = w.s; }
@@ -58,6 +68,42 @@ const eq = (a, b) => { for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) ret
 
 // ---- the properties ---------------------------------------------------------
 const PROPS = {
+  // NON-TRIVIALITY. Added after an external bug corpus scored the suite below
+  // 0/4: the zero function satisfies every relation here, because zero is
+  // permutation-equivariant, zero-row-preserving and batch-decomposable. Without
+  // this, a kernel can pass the whole suite by doing nothing at all.
+  async nonTriviality(K) {
+    const d = { m: 6, k: 32, n: 5, batch: 1 };
+    const out = await K(randf(d.m * d.k), randf(d.k * d.n), d);
+    let nz = 0;
+    for (let i = 0; i < out.length; i++) if (out[i] !== 0) nz++;
+    if (nz < out.length / 4) return `output is ${out.length - nz}/${out.length} zeros`;
+    return null;
+  },
+  // SENSITIVITY. Every element of A must be able to move its output row. Catches
+  // an accumulator that overwrites instead of accumulating (acc= for acc+=):
+  // every structural relation still holds, but only the last k contributes.
+  // Measured on the raw accumulator, perturbed by a sign flip that leaves the
+  // row absmax alone — otherwise the perturbation moves the output through the
+  // quantization SCALE and the property proves nothing.
+  async sensitivity(K) {
+    const d = { m: 6, k: 32, n: 5, batch: 1, acc: true };
+    const A = randf(d.m * d.k), B = randf(d.k * d.n);
+    for (let p = 0; p < d.k; p++) A[1 * d.k + p] = 0.3;
+    A[1 * d.k + 0] = 1.0;                               // pin the absmax at p=0
+    const s0 = V.quantizeRows(A, d.m, d.k).s[1];
+    const base = await K(A, B, d);
+    for (let p = 1; p < d.k; p++) {
+      const A2 = Float32Array.from(A);
+      A2[1 * d.k + p] = -0.3;
+      if (V.quantizeRows(A2, d.m, d.k).s[1] !== s0) continue;   // inconclusive
+      const o2 = await K(A2, B, d);
+      let moved = false;
+      for (let j = 0; j < d.n; j++) if (o2[1 * d.n + j] !== base[1 * d.n + j]) { moved = true; break; }
+      if (!moved) return `A[.,${p}] does not affect its output row`;
+    }
+    return null;
+  },
   // a zero row of A must produce a zero row of output, whatever the scales are
   async zeroRow(K) {
     const d = { m: 6, k: 32, n: 5, batch: 1 };
@@ -130,6 +176,12 @@ const PROPS = {
   ok(swapBad !== null, `rowPermutation catches swapped output rows  (${swapBad || "MISSED"})`);
   const swapZero = await PROPS.zeroRow(makeKernel("rowSwap"));
   console.log(`  note   zeroRow vs the same rowSwap bug: ${swapZero ? "caught" : "missed (properties are partial, not a proof)"}`);
+  // a bug from someone else's taxonomy, not mine: acc= instead of acc+=. Every
+  // structural relation survives it, which is why sensitivity had to exist.
+  const accSens = await PROPS.sensitivity(makeKernel("accOverwrite"));
+  const accPerm = await PROPS.rowPermutation(makeKernel("accOverwrite"));
+  ok(accSens !== null, `sensitivity catches acc= instead of acc+=  (${accSens || "MISSED"})`);
+  console.log(`  note   rowPermutation vs that same acc= bug: ${accPerm ? "caught" : "missed — it is structure-preserving, which is the whole trap"}`);
 
   console.log(pass ? "\nMETAMORPHIC TEST PASSED" : "\nMETAMORPHIC TEST FAILED");
   process.exit(pass ? 0 : 1);

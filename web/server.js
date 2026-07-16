@@ -30,6 +30,39 @@ const PUB = path.join(__dirname, "public");
 const TYPES = { ".html": "text/html", ".js": "text/javascript",
                 ".css": "text/css", ".json": "application/json" };
 
+// ---- training text: FineWeb-Edu, served by THIS server ----------------------
+// The browser used to call datasets-server.huggingface.co/rows directly, which
+// 503s routinely under load. The parquet files themselves sit on the HF CDN
+// behind plain resolve/ URLs — public, range-request friendly, and far more
+// reliable than the rows API. So this endpoint reads a random slice of a
+// random shard of the 10BT sample straight off the CDN with hyparquet (pure
+// JS, no native deps) and hands the browser plain text. FineWeb-Edu is the
+// ONLY dataset; there is no pass-through of client-chosen dataset ids.
+const FWE_BASE = "https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu/resolve/main/sample/10BT/";
+const FWE_SHARDS = Array.from({ length: 14 }, (_, i) => `${String(i).padStart(3, "0")}_00000.parquet`);
+const FWE_ROWS_PER_SLICE = 130;          // ~550k chars, what one training run consumes
+const fweCache = new Map();              // shard -> { file, metadata } (metadata is ~kBs)
+let hyparquet = null;                    // ESM — loaded on first use
+
+async function fweSlice() {
+  hyparquet = hyparquet || await import("hyparquet");
+  const shard = FWE_SHARDS[Math.floor(Math.random() * FWE_SHARDS.length)];
+  let entry = fweCache.get(shard);
+  if (!entry) {
+    const file = await hyparquet.asyncBufferFromUrl({ url: FWE_BASE + shard });
+    const metadata = await hyparquet.parquetMetadataAsync(file);
+    entry = { file, metadata };
+    fweCache.set(shard, entry);
+  }
+  const total = Number(entry.metadata.num_rows);
+  const start = Math.floor(Math.random() * Math.max(1, total - FWE_ROWS_PER_SLICE));
+  const rows = await hyparquet.parquetReadObjects({
+    file: entry.file, metadata: entry.metadata, columns: ["text"],
+    rowStart: start, rowEnd: start + FWE_ROWS_PER_SLICE,
+  });
+  return { shard, start, text: rows.map(r => r.text).join("\n") };
+}
+
 // keepalive: proxies (incl. HuggingFace's) close idle WebSockets — ping every
 // 30s keeps the pipe warm and detects dead clients within a minute
 setInterval(() => {
@@ -52,6 +85,19 @@ const server = http.createServer((req, res) => {
     let rtc = null;
     try { if (process.env.DAISY_RTC_CONFIG) rtc = JSON.parse(process.env.DAISY_RTC_CONFIG); } catch (e) {}
     return res.end(JSON.stringify({ forceRooms: !!process.env.DAISY_FORCE_ROOMS, rtc }));
+  }
+  if (p === "/data") {                 // a fresh random slice of FineWeb-Edu
+    return fweSlice()
+      .then(({ shard, start, text }) => {
+        res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8",
+                             "X-FWE-Shard": shard, "X-FWE-Row": String(start) });
+        res.end(text);
+      })
+      .catch((e) => {
+        console.error("fineweb slice failed:", e.message);
+        res.writeHead(503, { "Content-Type": "text/plain" });
+        res.end("fineweb-edu unavailable: " + e.message);
+      });
   }
   if (p === "/") p = "/index.html";
   const file = path.join(PUB, path.normalize(p));

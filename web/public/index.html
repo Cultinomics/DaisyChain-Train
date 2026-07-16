@@ -118,10 +118,8 @@
     <input type="range" id="cfgSteps" min="100" max="10000" step="100" value="300">
     <label class="slbl">Learning rate ×1000 <span class="sval" id="vcfgLr">10</span></label>
     <input type="range" id="cfgLr" min="5" max="50" step="5" value="10">
-    <label class="slbl" for="cfgData">Dataset (HuggingFace)</label>
-    <input type="text" id="cfgData" value="HuggingFaceFW/fineweb-edu" spellcheck="false"
-           style="width:100%;padding:9px 11px;border-radius:8px;border:1px solid var(--card-border);background:transparent;color:inherit;font-family:'Courier New',monospace;font-size:.9rem">
-    <p class="note" style="margin:.4rem 0 0">Any public dataset with a <code style="background:rgba(74,124,46,.12);padding:1px 4px;border-radius:4px">text</code> column works — each device streams its own random slice. Whoever presses Start picks it for the whole group; if streaming fails, the built-in corpus is used.</p>
+    <label class="slbl">Dataset</label>
+    <p class="note" style="margin:.2rem 0 0"><b>FineWeb-Edu</b> (HuggingFaceFW/fineweb-edu, 10BT sample) — fixed. Each device pulls its own random slice of the parquet shards, served by this Space; if streaming fails, the built-in corpus is used.</p>
     <p class="note" style="margin:.6rem 0 0"><b>This is pretraining, not fine-tuning</b> — every run trains a brand-new model from random weights. You are watching a language model learn from scratch.</p>
     <p class="note" style="margin:.5rem 0 0">A mini transformer language model — attention, MLP blocks, next-character prediction — every multiply through the verified INT8 units. Training text is streamed from <b>FineWeb-Edu</b> (HuggingFace); offline devices fall back to a built-in corpus. Whoever presses Start sets the settings for the whole group; total batch scales with every device that joins.</p>
   </div>

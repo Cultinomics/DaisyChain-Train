@@ -38,7 +38,6 @@ const ui = {
   cfgB: document.getElementById("cfgB"),
   cfgSteps: document.getElementById("cfgSteps"),
   cfgLr: document.getElementById("cfgLr"),
-  cfgData: document.getElementById("cfgData"),
   dataset: document.getElementById("dataset"),
   tokenizer: document.getElementById("tokenizer"),
   kit: document.getElementById("kit"),
@@ -395,16 +394,17 @@ const CFG_SENTINEL = -3;                       // wire: [int32 -3][int32 c,t,b,s
 function readCfgFromUI() {
   // lr crosses the wire as float32 — fround here so the leader trains with
   // the exact same value the followers decode (else Adam forks the weights)
+  // ds is FIXED: FineWeb-Edu is the only dataset (still broadcast, so mixed
+  // old/new clients keep interoperating — followers just ignore the choice)
   return { c: +ui.cfgC.value, t: +ui.cfgT.value, b: +ui.cfgB.value,
            steps: +ui.cfgSteps.value, lr: Math.fround(+ui.cfgLr.value / 1000),
-           ds: (ui.cfgData.value || "").trim() };
+           ds: "HuggingFaceFW/fineweb-edu" };
 }
 function showCfgInUI(cfg) {
   const set = (el, vid, val) => { el.value = val; document.getElementById(vid).textContent = val; };
   set(ui.cfgC, "vcfgC", cfg.c); set(ui.cfgT, "vcfgT", cfg.t); set(ui.cfgB, "vcfgB", cfg.b);
   set(ui.cfgSteps, "vcfgSteps", cfg.steps);
   set(ui.cfgLr, "vcfgLr", Math.round(cfg.lr * 1000));
-  if (cfg.ds) ui.cfgData.value = cfg.ds;
 }
 // switch the training text to a chosen dataset (whole group uses the same one);
 // on failure the built-in corpus stays and we log why
@@ -606,6 +606,28 @@ function hashWeights() {                        // FNV-1a over the flat param by
   for (let i = 0; i < b.length; i++) { h ^= b[i]; h = Math.imul(h, 0x01000193); }
   return h >>> 0;
 }
+// ---- roster-gradient repair --------------------------------------------------
+// Gradients travel peer-to-peer over a mesh, and the mesh can be asymmetric: a
+// peer's gradient reaches the leader (so it enters the roster) but never
+// reaches some follower — one flaky WebRTC link. The follower then can't
+// average (partial average = forked weights) and used to hard-stop the whole
+// run. But the LEADER holds every roster gradient by construction (the roster
+// IS the set that reached it), so the follower asks the leader to forward the
+// missing bytes instead of dying. Bit-exact: the same Float32Array bytes the
+// origin peer broadcast. The leader retains a few recent steps to serve these
+// (it steps at ~8s while a follower is stalled — its own cohort timeout — so a
+// small window covers the repair round trip).
+// wires: request  [i32 -7][i32 step][i32 peerNum]
+//        response [i32 -8][i32 step][i32 peerNum][u32 whash][u32 phash][f32 loss][f32 grad...]
+const REPAIRQ_SENTINEL = -7, REPAIRG_SENTINEL = -8;
+const REPAIR_RETAIN = 8;                        // steps of grads kept for repair
+function requestRepair(step, peerId2) {
+  const dc = chans.get(leaderId);
+  if (!dc || dc.readyState !== "open") return;
+  const rq = new ArrayBuffer(12);
+  new Int32Array(rq).set([REPAIRQ_SENTINEL, step, +peerId2.slice(1)]);
+  return dcSend(dc, rq);
+}
 // roster wire: [int32 -4][int32 step][int32 n][int32 peerNums...]
 const ROSTER_SENTINEL = -4;
 function broadcastRoster(step, ids) {
@@ -637,6 +659,33 @@ function onGrad(peerId, buf) {
     if (training && peerId !== leaderId) return;  // only the run's leader may steer sync
     const iv = new Int32Array(buf);
     rosters.set(iv[1], [...iv.slice(3, 3 + iv[2])].map(n => "p" + n));
+    wake(); return;
+  }
+  if (step === REPAIRQ_SENTINEL) {               // a peer asks for a grad it never got
+    const [, rstep, num] = new Int32Array(buf, 0, 3);
+    const pid = "p" + num;
+    const g = (incoming.get(rstep) || new Map()).get(pid);
+    const meta = (peerHashes.get(rstep) || new Map()).get(pid);
+    if (!g || !meta) return;                     // already evicted — requester halts as before
+    const out = new ArrayBuffer(24 + g.byteLength);
+    new Int32Array(out, 0, 3).set([REPAIRG_SENTINEL, rstep, num]);
+    new Uint32Array(out, 12, 2).set([meta.hash, meta.phash]);
+    new Float32Array(out, 20, 1)[0] = meta.loss;
+    new Float32Array(out, 24).set(g);
+    const dc = chans.get(peerId);
+    if (dc && dc.readyState === "open") dcSend(dc, out);
+    return;
+  }
+  if (step === REPAIRG_SENTINEL) {               // leader-forwarded copy of a missing grad
+    if (peerId !== leaderId) return;             // only the leader may vouch for another peer's grad
+    const iv = new Int32Array(buf, 0, 3);
+    const rstep = iv[1], pid = "p" + iv[2];
+    const [rwhash, rphash] = new Uint32Array(buf, 12, 2);
+    const rloss = new Float32Array(buf, 20, 1)[0];
+    if (!incoming.has(rstep)) incoming.set(rstep, new Map());
+    if (!incoming.get(rstep).has(pid)) incoming.get(rstep).set(pid, new Float32Array(buf.slice(24)));
+    if (!peerHashes.has(rstep)) peerHashes.set(rstep, new Map());
+    if (!peerHashes.get(rstep).has(pid)) peerHashes.get(rstep).set(pid, { hash: rwhash, phash: rphash, loss: rloss });
     wake(); return;
   }
   const [whash, phash] = new Uint32Array(buf, 4, 2);
@@ -743,6 +792,12 @@ async function train(cfg, resume) {
         if (auditFailure) { halted = auditFailure; break; }
         lastLocal = { s, loss, grad };
         await broadcastGrad(s, whash, probeHash, loss, grad);
+        // keep my own grad addressable too, so repair requests for MY grad
+        // (a peer that never received it) can be served like any other
+        if (!incoming.has(s)) incoming.set(s, new Map());
+        incoming.get(s).set(myId, grad);
+        if (!peerHashes.has(s)) peerHashes.set(s, new Map());
+        peerHashes.get(s).set(myId, { hash: whash, phash: probeHash, loss });
       }
     }
     let all;
@@ -794,7 +849,17 @@ async function train(cfg, resume) {
       }
       const roster = rosters.get(s);
       const need = roster.filter(id => id !== myId);
-      const ok = await waitFor(() => need.every(id => (incoming.get(s) || new Map()).has(id)), 10000);
+      const haveAll = () => need.every(id => (incoming.get(s) || new Map()).has(id));
+      let ok = await waitFor(haveAll, 2500);
+      if (!ok && chans.has(leaderId)) {
+        // mesh asymmetry: the grad reached the leader (it's in the roster) but
+        // not me — ask the leader to forward it rather than stopping the run
+        const missing = need.filter(id => !(incoming.get(s) || new Map()).has(id));
+        log(`step ${s + 1}: still missing ${missing.map(nmeOf).join(", ")} — requesting repair from ${nmeOf(leaderId)}`);
+        for (const id of missing) await requestRepair(s, id);
+        ok = await waitFor(haveAll, 12000);
+        if (ok) log(`step ${s + 1}: repaired — continuing`);
+      }
       if (!ok) {
         halted = `missing a roster gradient at step ${s + 1} — applying a partial average would fork the weights`;
         break;
@@ -831,7 +896,8 @@ async function train(cfg, resume) {
     const avg = TrainCore.averageGrads(all);
     const upd = opt.step(avg);                      // DaisyAdam on the cluster-avg grad
     Transformer.applyUpdate(model, upd);            // W -= upd (lr folded into upd)
-    incoming.delete(s); rosters.delete(s); peerHashes.delete(s);
+    // retain a few applied steps so stalled peers can repair (evict beyond that)
+    incoming.delete(s - REPAIR_RETAIN); rosters.delete(s - REPAIR_RETAIN); peerHashes.delete(s - REPAIR_RETAIN);
     trainedSteps++;
     if (s % 10 === 0 || s === steps - 1) {
       ui.loss.textContent = clusterLoss.toFixed(5);
@@ -976,8 +1042,8 @@ function buildModel(cfg) {
     navigator.connection.addEventListener("change", () => {
       if (!ws || ws.readyState > 1) { log("network changed — reconnecting"); connectSignaling(); }
     });
-  // dataset: stream the chosen dataset from HuggingFace; built-in corpus if offline
-  loadDataset((ui.cfgData.value || "").trim());
+  // dataset: FineWeb-Edu (hardcoded), streamed from this Space's /data endpoint
+  loadDataset("HuggingFaceFW/fineweb-edu");
   ui.start.onclick = async () => {
     if (training) return;
     const cfg = readCfgFromUI();
