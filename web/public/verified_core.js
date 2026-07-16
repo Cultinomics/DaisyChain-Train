@@ -100,6 +100,82 @@
     return { q, s };
   }
 
+  // ---- B2B MLP chain (CUTLASS ex. 13 two-GEMM fusion + ex. 23 epilogue
+  // reduction), respecced for cross-device exactness ---------------------------
+  // The MLP is the one back-to-back GEMM pair with no layernorm/softmax between
+  // (ReLU is already fused in the epilogue), so the intermediate h1 can be
+  // quantized ON the GPU and fed straight to the second GEMM. Two rules make
+  // that fleet-safe:
+  //   1. The per-row |max| (ex. 23) uses only comparisons — exact on any
+  //      hardware, order-independent — and comes back to JS as ~1KB.
+  //   2. Scale DERIVATION (two divisions) stays in JS f64, which IEEE requires
+  //      to be exactly rounded and is therefore identical on every device.
+  //      WGSL division is only 2.5 ULP — a fork waiting to happen — but WGSL
+  //      multiply/add are correctly rounded and floor/clamp are exact. So the
+  //      quantize step is respecced from  round(x / scale)  to
+  //      floor(f32(x * invScale) + 0.5)  — floor(x+0.5) IS Math.round's tie
+  //      rule — and the fround-stepped mirror below is bit-identical to the
+  //      GPU kernel, which is exact-gated against it at init.
+  // NOTE this changes which int8 a value on a rounding boundary lands on
+  // (≤1 step) vs quantizeRows, so old and new builds cannot co-train — the
+  // divergence guard stops such mixed groups by design.
+  function rowAbsMax(X, rows, cols) {
+    const mx = new Float32Array(rows);
+    for (let r = 0; r < rows; r++) {
+      let m = 0;
+      for (let c = 0; c < cols; c++) { const a = Math.abs(X[r * cols + c]); if (a > m) m = a; }
+      mx[r] = m;
+    }
+    return mx;
+  }
+  function scalesFromAbsMax(mx) {                // f64 divisions: exactly rounded, device-identical
+    const scale = new Float32Array(mx.length), inv = new Float32Array(mx.length);
+    for (let i = 0; i < mx.length; i++) {
+      scale[i] = Math.max(mx[i] / 127, 1e-8);
+      inv[i] = 1 / scale[i];                     // recip of the STORED f32 scale
+    }
+    return { scale, inv };
+  }
+  function quantizeRowsInv(X, rows, cols, inv) { // bit-exact mirror of the GPU quantize kernel
+    const q = new Int8Array(rows * cols);
+    for (let r = 0; r < rows; r++) {
+      const iv = inv[r];
+      for (let c = 0; c < cols; c++) {
+        const n = Math.floor(f32(f32(X[r * cols + c] * iv) + 0.5));
+        q[r * cols + c] = n < -128 ? -128 : n > 127 ? 127 : n;
+      }
+    }
+    return q;
+  }
+  // the chained MLP: X @ W1 -> ReLU (fused) -> absmax -> quantize -> @ W2.
+  //   d = { m, k, h, n };  gpuMlp (from webgpu.js) runs both GEMMs + the
+  // on-GPU quantize with one tiny absmax readback between; without it the CPU
+  // mirror chain runs — SAME math, so mixed GPU/CPU fleets stay bit-identical.
+  async function vmlpBlock(Xf, W1f, W2f, d, L, gpuMlp, audit) {
+    const x = quantizeRows(Xf, d.m, d.k);
+    const w1 = quantizeCols(W1f, d.k, d.h);
+    const w2 = quantizeCols(W2f, d.h, d.n);
+    if (gpuMlp) {
+      const r = await gpuMlp(x.q, w1.q, w2.q, x.s, w1.s, w2.s, d);
+      if (audit && audit.due()) {
+        // audit BOTH live GEMMs: gemm1 against the units directly; gemm2 by
+        // reconstructing its exact operand through the proven quantize mirror
+        const bad1 = auditTile(x.q, w1.q, x.s, w1.s, { m: d.m, k: d.k, n: d.h, relu: true }, r.h1, L, audit.cells);
+        if (bad1) { audit.fail("mlp gemm1: " + bad1); return r; }
+        const sc = scalesFromAbsMax(rowAbsMax(r.h1, d.m, d.h));
+        const hq = quantizeRowsInv(r.h1, d.m, d.h, sc.inv);
+        const bad2 = auditTile(hq, w2.q, sc.scale, w2.s, { m: d.m, k: d.h, n: d.n }, r.out, L, audit.cells);
+        if (bad2) audit.fail("mlp gemm2: " + bad2);
+      }
+      return r;
+    }
+    const h1 = bgemmJS(x.q, w1.q, x.s, w1.s, { m: d.m, k: d.k, n: d.h, batch: 1, relu: true }, L);
+    const sc = scalesFromAbsMax(rowAbsMax(h1, d.m, d.h));
+    const hq = quantizeRowsInv(h1, d.m, d.h, sc.inv);
+    const out = bgemmJS(hq, w2.q, sc.scale, w2.s, { m: d.m, k: d.h, n: d.n, batch: 1 }, L);
+    return { h1, out };
+  }
+
   // ---- epilogue mirror -------------------------------------------------------
   // BIT-EXACT mirror of the WGSL epilogue `f32(s) * a * b`. WGSL rounds to f32
   // after the int->float conversion and after EACH multiply; plain JS would do
@@ -307,7 +383,8 @@
   }
 
   const api = { quantize, quantize2, quantizeRows, quantizeCols, quantizeHeadCols, lutMatmulJS, lutMatmul3JS, lutMatmul3,
-                bgemmJS, vgemmBlock, auditTile, epi, attScoresJS, attCtxJS, linearFwd, forward, backward, splitApply };
+                bgemmJS, vgemmBlock, auditTile, epi, attScoresJS, attCtxJS, linearFwd, forward, backward, splitApply,
+                rowAbsMax, scalesFromAbsMax, quantizeRowsInv, vmlpBlock };
   if (typeof module !== "undefined" && module.exports) { TC = require("./traincore.js"); module.exports = api; }
   else { TC = root.TrainCore; root.Verified = api; }
 })(typeof self !== "undefined" ? self : this);

@@ -108,6 +108,40 @@ width 32 (the shared operand is only 32 KB there — the saved quantize work
 scales quadratically with model width). Two-device live run: both replicas
 at step 71/300 with identical loss to the last digit, no sync-guard trips.
 
+## B2B MLP chain (CUTLASS ex. 13 two-GEMM fusion + ex. 23 epilogue reduction)
+
+The MLP's two GEMMs now run back-to-back on the GPU: gemm1 (ReLU fused) and a
+per-row |max| reduction share one command encoder, ~1 KB of absmax comes back
+to JS (scale derivation needs division, which WGSL only guarantees to 2.5 ULP
+— JS f64 division is exactly rounded and device-identical), then h1 is
+quantized ON-DEVICE and fed straight to gemm2. h1 returns to JS only because
+the STE backward needs it; it never goes up again.
+
+This required respeccing the intermediate quantize from `round(x / scale)` to
+`floor(f32(x * invScale) + 0.5)` — WGSL multiply/add are correctly rounded and
+floor/clamp exact, so the GPU kernel and the fround-stepped JS mirror agree
+bit-for-bit, and CPU-fallback devices run the mirror so mixed fleets stay
+bit-identical. The respec is a real (bounded) math change: old and new builds
+cannot co-train, and the per-step divergence guard stops such mixed groups.
+
+`test_b2b.js` (Node):
+
+```
+scales from the fused absmax bit-identical to quantizeRows (3958 rows incl. zero rows)
+respec moves an int8 by at most 1 step (1/112363 = 0.001% of values moved)
+chain gemm1 (hence h1 and the ReLU mask) byte-identical to the un-chained GEMM
+chain output equals the manual composition of its stages; deterministic
+convergence unchanged: old 2.0500 vs new 2.0512 final loss (0.1% apart, 40 steps)
+```
+
+On GPU: both chain variants (LUT shader and DP4A) pass an exact `!==` init
+gate against the mirror chain over ragged shapes including pack-tail padding.
+Discriminating proof that the kernel implements the RESPEC and not the old
+spec: a searched-for boundary input (int8 68→69 under the respec) run through
+the GPU chain matches the new-spec mirror exactly and differs from the
+old-spec composition. Two-device live run: step 141/300 with identical loss
+(6.23958) on both replicas, per-step weight-hash divergence checks silent.
+
 One bug was caught during the rework, by the bit-identity check itself: the
 fused q+k+v sum initially ran in f64 and rounded once, where the old code
 rounded to f32 after each add — a last-ulp fork that would have split

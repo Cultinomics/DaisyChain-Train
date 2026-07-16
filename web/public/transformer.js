@@ -182,6 +182,7 @@
       cfg: { ...cfg, layers, heads, hidden, vocab: vocabSize() },
       ctx: { L, bgemm: (engine && engine.bgemm) || null,
              att: (engine && engine.att) || null, fgemm: (engine && engine.fgemm) || null,
+             mlp: (engine && engine.mlp) || null,
              audit: audit || null, unitBackward: !!cfg.unitBackward },
       emb: add("emb", mk(vocabSize() * c, 0.08)),
       pos: add("pos", mk(cfg.t * c, 0.02)),
@@ -292,11 +293,16 @@
       for (let i = 0; i < x2.length; i++) x2[i] = x[i] + attnOut[i];
       cb.x2 = x2;
       const l2 = lnFwd(x2, BT, C); cb.ln2 = l2;
-      const h1 = await vmm(l2.y, bl.W1, BT, C, hidden, ctx, true);  // ReLU fused in the epilogue
+      // CUTLASS ex. 13 + 23: both MLP GEMMs run back-to-back on the GPU. The
+      // intermediate h1 is quantized ON-DEVICE (exact-gated respec — see
+      // vmlpBlock in verified_core.js) and only its per-row absmax (~1KB)
+      // visits JS between the GEMMs; h1 itself comes back solely because the
+      // STE backward needs it. CPU devices run the bit-identical mirror chain.
+      const { h1, out: mlpOut } = await V.vmlpBlock(l2.y, bl.W1, bl.W2,
+        { m: BT, k: C, h: hidden, n: C }, ctx.L, ctx.mlp, ctx.audit);
       const mask = new Uint8Array(h1.length);
       for (let i = 0; i < h1.length; i++) if (h1[i] > 0) mask[i] = 1;
       cb.h1 = h1; cb.mask = mask;
-      const mlpOut = await vmm(h1, bl.W2, BT, hidden, C, ctx);
       x = new Float32Array(BT * C);
       for (let i = 0; i < x.length; i++) x[i] = x2[i] + mlpOut[i];
       cache.blocks.push(cb);

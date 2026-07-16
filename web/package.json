@@ -6,7 +6,7 @@
   "author": "Dean Byrne (Quazim0t0) / DaisyChainAI",
   "scripts": {
     "start": "node server.js",
-    "test": "node test_core.js && node test_verified.js && node test_ieee.js && node test_gates.js && node test_metamorphic.js && node test_corpus.js && node test_optimizer.js && node test_transformer.js && node test_unit_backward.js"
+    "test": "node test_core.js && node test_verified.js && node test_ieee.js && node test_gates.js && node test_metamorphic.js && node test_corpus.js && node test_b2b.js && node test_optimizer.js && node test_transformer.js && node test_unit_backward.js"
   },
   "dependencies": {
     "hyparquet": "^1.26.2",

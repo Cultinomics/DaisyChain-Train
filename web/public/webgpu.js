@@ -35,6 +35,57 @@
       C[row * n + col] = s;
     }`;
 
+  // ---- B2B MLP chain kernels (CUTLASS ex. 13 + 23) ---------------------------
+  // ROWMAX: per-row |max| of a GEMM's f32 output, fused into the same command
+  // encoder (ex. 23 epilogue reduction). Non-negative f32 bit patterns order
+  // like u32, so atomicMax on bitcast(abs(v)) computes an EXACT max, in any
+  // execution order, on any hardware — nothing here can round.
+  const WGSL_ROWMAX = `
+    @group(0) @binding(0) var<storage, read> O : array<f32>;
+    @group(0) @binding(1) var<storage, read_write> MX : array<atomic<u32>>;
+    @group(0) @binding(2) var<uniform> dims : vec4<u32>;         // m, n, _, _
+    @compute @workgroup_size(8, 8, 1)
+    fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+      let m = dims.x; let n = dims.y;
+      let row = gid.x; let col = gid.y;
+      if (row >= m || col >= n) { return; }
+      atomicMax(&MX[row], bitcast<u32>(abs(O[row * n + col])));
+    }`;
+  // QUANT: h1 (f32, still on the GPU) -> int8 by MULTIPLY with a JS-computed
+  // inverse scale. floor(f32(x*inv)+0.5) uses only ops WGSL guarantees exact
+  // or correctly rounded (mul, add, floor, clamp) — division is 2.5 ULP and
+  // never runs on the GPU. Bit-identical to Verified.quantizeRowsInv, and
+  // exact-gated against it at init. pack=true emits 4 bytes per u32 for the
+  // DP4A kernel; pack=false emits one i32 per element for the LUT kernel.
+  const WGSL_QUANT = (pack) => `
+    @group(0) @binding(0) var<storage, read> H : array<f32>;
+    @group(0) @binding(1) var<storage, read> inv : array<f32>;   // per row
+    @group(0) @binding(2) var<storage, read_write> Q : array<${pack ? "u32" : "i32"}>;
+    @group(0) @binding(3) var<uniform> dims : vec4<u32>;         // m, k, kw, _
+    @compute @workgroup_size(64)
+    fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+      let m = dims.x; let k = dims.y; let kw = dims.z;
+      let idx = gid.x;
+      ${pack ? `
+      if (idx >= m * kw) { return; }
+      let row = idx / kw;
+      var acc : u32 = 0u;
+      for (var b = 0u; b < 4u; b = b + 1u) {
+        let c = (idx % kw) * 4u + b;
+        var q : i32 = 0;
+        if (c < k) {
+          let v = clamp(floor(H[row * k + c] * inv[row] + 0.5), -128.0, 127.0);
+          q = i32(v);
+        }
+        acc = acc | ((u32(q) & 255u) << (8u * b));
+      }
+      Q[idx] = acc;` : `
+      if (idx >= m * k) { return; }
+      let row = idx / k;
+      let v = clamp(floor(H[idx] * inv[row] + 0.5), -128.0, 127.0);
+      Q[idx] = i32(v);`}
+    }`;
+
   // NOTE: the un-batched DP4A matmul that used to live here was removed. It was
   // the only kernel with an exact gate, but the transformer stopped calling it
   // when the block-scaled path landed — so it sat here passing its own gate
@@ -252,6 +303,11 @@
       const bgLutLayout = mkLayout(["r", "r", "r", "r", "r", "rw", "u"]);
       const bgDp4Layout = mkLayout(["r", "r", "r", "r", "rw", "u"]);
       const attLayout = mkLayout(["r", "r", "r", "r", "rw", "u"]);
+      const rowmaxLayout = mkLayout(["r", "rw", "u"]);
+      const quantLayout = mkLayout(["r", "r", "rw", "u"]);
+      const rowmaxPipe = mkPipeL(WGSL_ROWMAX, rowmaxLayout);
+      const quantI32Pipe = mkPipeL(WGSL_QUANT(false), quantLayout);
+      const quantPackPipe = mkPipeL(WGSL_QUANT(true), quantLayout);
       // live + verify variants, compiled from the same source (see WGSL_* above)
       const bgLutPipe = mkPipeL(WGSL_BG_LUT(false), bgLutLayout), bgLutVPipe = mkPipeL(WGSL_BG_LUT(true), bgLutLayout);
       const scoresPipe = mkPipeL(WGSL_ATT_SCORES(false), attLayout), scoresVPipe = mkPipeL(WGSL_ATT_SCORES(true), attLayout);
@@ -342,9 +398,34 @@
       // the LUT bgemm is the fallback AND the oracle's shader twin — gate it too
       const lutBad = await gateBgemm(bgLut);
       if (lutBad) { console.warn("LUT bgemm shader failed verification — CPU mirrors only:", lutBad); return cpu; }
+
+      // B2B MLP chain gate (CUTLASS ex. 13+23): run the WHOLE chain — gemm1 +
+      // ReLU + on-GPU rowmax + on-GPU quantize + gemm2 — against the pure-JS
+      // mirror chain, exact `!==` on both h1 and the final output. Sweeps
+      // ragged shapes; h not a multiple of 4 exercises the pack-tail padding.
+      async function gateMlp(mlpFn) {
+        for (const d0 of [{ m: 6, k: 8, h: 12, n: 5 }, { m: 5, k: 16, h: 6, n: 3 },
+                          { m: 17, k: 33, h: 10, n: 9 }, { m: 32, k: 64, h: 128, n: 32 }]) {
+          const rnd = (len) => Float32Array.from({ length: len }, () => Math.random() * 2 - 1);
+          const Xf = rnd(d0.m * d0.k), W1 = rnd(d0.k * d0.h), W2 = rnd(d0.h * d0.n);
+          const hw = await root.Verified.vmlpBlock(Xf, W1, W2, d0, L, mlpFn, null);
+          const ref = await root.Verified.vmlpBlock(Xf, W1, W2, d0, L, null, null);
+          const shape = `${d0.m}x${d0.k}x${d0.h}x${d0.n}`;
+          for (let i = 0; i < ref.h1.length; i++)
+            if (hw.h1[i] !== ref.h1[i]) return `h1 mismatch @${i} (${shape}): ${hw.h1[i]} vs ${ref.h1[i]}`;
+          for (let i = 0; i < ref.out.length; i++)
+            if (hw.out[i] !== ref.out[i]) return `out mismatch @${i} (${shape}): ${hw.out[i]} vs ${ref.out[i]}`;
+        }
+        return null;
+      }
+      const lutMlpEnv = { dp4: false, gemm: bgLutPipe, rowmax: rowmaxPipe, quant: quantI32Pipe, lutBuf };
+      let mlpLut = (xq, w1q, w2q, xs, w1s, w2s, d) => gpuMlpChain(device, lutMlpEnv, xq, w1q, w2q, xs, w1s, w2s, d);
+      const mlpLutBad = await gateMlp(mlpLut);
+      if (mlpLutBad) { console.warn("B2B MLP chain (LUT) failed verification — MLP stays on the CPU mirror chain:", mlpLutBad); mlpLut = null; }
+
       const viaLUT = { backend: "webgpu", label: `${gpuName} (LUT shader · exact-gated)`,
                        matmulInt8: (Xq, Wq, m, k, n) => gpuMatmulLUT(device, lutPipe, lutBuf, Xq, Wq, m, k, n),
-                       bgemm: bgLut, att, fgemm };
+                       bgemm: bgLut, att, fgemm, mlp: mlpLut };
 
       // DP4A pipeline — only if the WGSL feature exists AND its batched kernel
       // reproduces the verified units exactly across the shape sweep
@@ -357,8 +438,12 @@
         console.warn("batched DP4A disagreed with the verified units — using LUT bgemm:", dp4Bad);
         return viaLUT;
       }
+      const dp4MlpEnv = { dp4: true, gemm: bgDp4Pipe, rowmax: rowmaxPipe, quant: quantPackPipe };
+      let mlpDp4 = (xq, w1q, w2q, xs, w1s, w2s, d) => gpuMlpChain(device, dp4MlpEnv, xq, w1q, w2q, xs, w1s, w2s, d);
+      const mlpDp4Bad = await gateMlp(mlpDp4);
+      if (mlpDp4Bad) { console.warn("B2B MLP chain (DP4A) failed verification — using the LUT chain:", mlpDp4Bad); mlpDp4 = mlpLut; }
       return { backend: "webgpu", label: `${gpuName} (DP4A int8 dot · exact-gated vs units)`,
-               bgemm: bg, att, fgemm };
+               bgemm: bg, att, fgemm, mlp: mlpDp4 };
     } catch (e) { console.warn("WebGPU init failed, CPU fallback:", e); return cpu; }
   }
 
@@ -513,6 +598,85 @@
       { binding: 4, resource: { buffer: bufO } }, { binding: 5, resource: { buffer: bufD } } ], m, n, batch, d.acc);
     [bufX, bufW, bufR, bufS, bufD, r.bufO, r.read].forEach(b => b.destroy());
     return r.out;
+  }
+
+  // B2B MLP chain: gemm1 (ReLU fused) + rowmax in one encoder, a 4·m-byte
+  // absmax readback, then quantize + gemm2 in a second encoder. h1 comes back
+  // because the STE backward needs it, but it never goes UP again — gemm2's
+  // left operand is produced and consumed entirely on the GPU.
+  async function gpuMlpChain(device, env, xq, w1q, w2q, xs, w1s, w2s, d) {
+    const { m, k, h, n } = d, dp4 = !!env.dp4;
+    const SU = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
+    let bufX, bufW1, bufW2, kw1, hw;
+    if (dp4) {
+      kw1 = Math.ceil(k / 4); hw = Math.ceil(h / 4);
+      bufX = up(device, packRows(xq, m, k, kw1), SU);
+      bufW1 = up(device, packRows(transposeI8(w1q, k, h), h, k, kw1), SU);
+      bufW2 = up(device, packRows(transposeI8(w2q, h, n), n, h, hw), SU);
+    } else {
+      kw1 = k; hw = h;
+      bufX = up(device, Int32Array.from(xq), SU);
+      bufW1 = up(device, Int32Array.from(w1q), SU);
+      bufW2 = up(device, Int32Array.from(w2q), SU);
+    }
+    const bufRs = up(device, xs, SU), bufCs1 = up(device, w1s, SU), bufCs2 = up(device, w2s, SU);
+    const bufH = mk(device, m * h * 4, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+    const bufMX = mk(device, m * 4, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);  // zero-initialized
+    const UU = GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST;
+    const bufD1 = up(device, new Uint32Array([m, kw1, h, 1]), UU);       // flags=1: fused ReLU
+    const bufDM = up(device, new Uint32Array([m, h, 0, 0]), UU);
+    const gemmBind = (bufA, bufB, bufR, bufC, bufO, bufD) => device.createBindGroup({
+      layout: env.gemm.getBindGroupLayout(0),
+      entries: (dp4 ? [bufA, bufB, bufR, bufC, bufO, bufD]
+                    : [bufA, bufB, env.lutBuf, bufR, bufC, bufO, bufD])
+        .map((b, i) => ({ binding: i, resource: { buffer: b } })) });
+    const enc1 = device.createCommandEncoder();
+    let pass = enc1.beginComputePass();
+    pass.setPipeline(env.gemm);
+    pass.setBindGroup(0, gemmBind(bufX, bufW1, bufRs, bufCs1, bufH, bufD1));
+    pass.dispatchWorkgroups(Math.ceil(m / 8), Math.ceil(h / 8), 1); pass.end();
+    pass = enc1.beginComputePass();
+    pass.setPipeline(env.rowmax);
+    pass.setBindGroup(0, device.createBindGroup({ layout: env.rowmax.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: bufH } }, { binding: 1, resource: { buffer: bufMX } },
+      { binding: 2, resource: { buffer: bufDM } } ] }));
+    pass.dispatchWorkgroups(Math.ceil(m / 8), Math.ceil(h / 8), 1); pass.end();
+    const readH = mk(device, m * h * 4, GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ);
+    const readM = mk(device, m * 4, GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ);
+    enc1.copyBufferToBuffer(bufH, 0, readH, 0, m * h * 4);
+    enc1.copyBufferToBuffer(bufMX, 0, readM, 0, m * 4);
+    device.queue.submit([enc1.finish()]);
+    await Promise.all([readH.mapAsync(GPUMapMode.READ), readM.mapAsync(GPUMapMode.READ)]);
+    const h1 = new Float32Array(readH.getMappedRange().slice(0)); readH.unmap();
+    // the atomicMax'ed u32 bit patterns ARE the f32 |max| values
+    const mx = new Float32Array(readM.getMappedRange().slice(0)); readM.unmap();
+    // scale derivation in JS f64 — exactly rounded, identical on every device
+    // (WGSL division is 2.5 ULP, which is why it never runs on the GPU)
+    const sc = root.Verified.scalesFromAbsMax(mx);
+    const bufInv = up(device, sc.inv, SU), bufHs = up(device, sc.scale, SU);
+    const bufQ = mk(device, m * hw * 4, GPUBufferUsage.STORAGE);
+    const bufDQ = up(device, new Uint32Array([m, h, hw, 0]), UU);
+    const bufD2 = up(device, new Uint32Array([m, hw, n, 0]), UU);
+    const bufO = mk(device, m * n * 4, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+    const enc2 = device.createCommandEncoder();
+    pass = enc2.beginComputePass();
+    pass.setPipeline(env.quant);
+    pass.setBindGroup(0, device.createBindGroup({ layout: env.quant.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: bufH } }, { binding: 1, resource: { buffer: bufInv } },
+      { binding: 2, resource: { buffer: bufQ } }, { binding: 3, resource: { buffer: bufDQ } } ] }));
+    pass.dispatchWorkgroups(Math.ceil((m * (dp4 ? hw : h)) / 64)); pass.end();
+    pass = enc2.beginComputePass();
+    pass.setPipeline(env.gemm);
+    pass.setBindGroup(0, gemmBind(bufQ, bufW2, bufHs, bufCs2, bufO, bufD2));
+    pass.dispatchWorkgroups(Math.ceil(m / 8), Math.ceil(n / 8), 1); pass.end();
+    const readO = mk(device, m * n * 4, GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ);
+    enc2.copyBufferToBuffer(bufO, 0, readO, 0, m * n * 4);
+    device.queue.submit([enc2.finish()]);
+    await readO.mapAsync(GPUMapMode.READ);
+    const out = new Float32Array(readO.getMappedRange().slice(0)); readO.unmap();
+    [bufX, bufW1, bufW2, bufRs, bufCs1, bufCs2, bufH, bufMX, bufD1, bufDM,
+     bufInv, bufHs, bufQ, bufDQ, bufD2, bufO, readH, readM, readO].forEach(b => b.destroy());
+    return { h1, out };
   }
 
   function mk(device, size, usage) { return device.createBuffer({ size, usage }); }
