@@ -851,14 +851,18 @@ async function train(cfg, resume) {
       const need = roster.filter(id => id !== myId);
       const haveAll = () => need.every(id => (incoming.get(s) || new Map()).has(id));
       let ok = await waitFor(haveAll, 2500);
-      if (!ok && chans.has(leaderId)) {
+      if (!ok) {
         // mesh asymmetry: the grad reached the leader (it's in the roster) but
-        // not me — ask the leader to forward it rather than stopping the run
+        // not me — ask the leader to forward it rather than stopping the run.
+        // If the leader itself has left, still wait the full window: the
+        // missing grads may be in flight from their origin peers directly.
         const missing = need.filter(id => !(incoming.get(s) || new Map()).has(id));
-        log(`step ${s + 1}: still missing ${missing.map(nmeOf).join(", ")} — requesting repair from ${nmeOf(leaderId)}`);
-        for (const id of missing) await requestRepair(s, id);
+        if (chans.has(leaderId)) {
+          log(`step ${s + 1}: still missing ${missing.map(nmeOf).join(", ")} — requesting repair from ${nmeOf(leaderId)}`);
+          for (const id of missing) await requestRepair(s, id);
+        }
         ok = await waitFor(haveAll, 12000);
-        if (ok) log(`step ${s + 1}: repaired — continuing`);
+        if (ok) log(`step ${s + 1}: gradient(s) recovered — continuing`);
       }
       if (!ok) {
         halted = `missing a roster gradient at step ${s + 1} — applying a partial average would fork the weights`;

@@ -1,6 +1,6 @@
-# Test results — 2026-07-15
+# Test results — updated 2026-07-16
 
-All suites run with `npm test` (chains all nine). Every suite exits 0.
+All suites run with `npm test` (chains all ten). Every suite exits 0.
 Hardware for GPU numbers: NVIDIA via WebGPU, DP4A int8 dot path, exact-gated
 against the verified units at init.
 
