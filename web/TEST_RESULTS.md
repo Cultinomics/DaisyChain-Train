@@ -43,12 +43,21 @@ so the bug list has a different author than the checks.
 |---|---|---|---|
 | `acc=` instead of `acc+=` | loop | CAUGHT (sensitivity) | CAUGHT |
 | missing bounds guard (mult-of-8) | loop | CAUGHT (nonTriviality) | CAUGHT |
-| dropped constant factor (2×) | math | missed | CAUGHT |
-| wrong leaky-ReLU alpha | math | missed | CAUGHT |
+| dropped constant factor (2×) | math | CAUGHT (unitScaleAnchor) | CAUGHT |
+| wrong leaky-ReLU alpha | math | CAUGHT (reluRange) | CAUGHT |
 
-The split is the finding: properties are a **loop-bug detector** (2/2), blind
-to structure-preserving value bugs (0/2). Those are owned by the differential
-gate against the spec-correct mirror. Each check class has an owner.
+**4/4 both oracles** — but the road there is the finding. The first score was
+0/4; adding non-triviality and sensitivity got the loop bugs (2/4). The two
+math bugs are provably invisible to any RELATION — if `out` satisfies every
+relation, so does `c·out` — so no cleverer relation exists. Closing them took
+a different species of check: **definitional absolutes**. `reluRange` (ReLU
+output cannot be negative — a range constraint from the definition) catches
+the leaky alpha; `unitScaleAnchor` (at unit scales dequant is the identity, so
+the output must equal the exact integer dot product, computed with plain
+integer arithmetic — no LUT, no mirror) pins absolute scale and catches the
+uniform 2×. Still no reference implementation anywhere in the property suite;
+the suite is now relations for the loop plus spec-pinned absolutes for the
+values, and the differential gate remains an independent second opinion.
 
 ## Backward rework: bit-identity + GPU wall clock
 

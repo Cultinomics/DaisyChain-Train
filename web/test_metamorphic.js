@@ -12,6 +12,17 @@
 // the behaviour is wrong, regardless of which side is "right". They hold exactly
 // (not approximately) because per-row/per-column quantization commutes with
 // permutation, and because int32 accumulation is exactly associative.
+//
+// The suite is TWO species of check, and the distinction matters:
+//   RELATIONS (permutation, zero-row, batch, sensitivity) — compare calls to
+//     each other. Provably blind to value bugs: if out satisfies every
+//     relation, so does c·out. An external bug corpus scored exactly this
+//     hole (2/2 on loop bugs, 0/2 on math bugs).
+//   DEFINITIONAL ABSOLUTES (reluRange, unitScaleAnchor) — points where the
+//     spec pins the value itself: ReLU output cannot be negative, and at unit
+//     scales the output IS the integer dot product. Still no reference
+//     implementation anywhere — the expected values are plain integer
+//     arithmetic — but they close the value-bug hole the relations cannot.
 const fs = require("fs");
 const path = require("path");
 const V = require("./public/verified_core.js");
@@ -60,6 +71,16 @@ function makeKernel(bug) {
       if (m > 1) for (let j = 0; j < n; j++) { const t = out[0 * n + j]; out[0 * n + j] = out[1 * n + j]; out[1 * n + j] = t; }
       return out;
     }
+    if (bug === "factor2") {              // corpus: gelu_triton_buggy — uniform 2x
+      const out = V.bgemmJS(x.q, wq, x.s, ws, d, L);
+      for (let i = 0; i < out.length; i++) out[i] = Math.fround(out[i] * 2);
+      return out;
+    }
+    if (bug === "leakyAlpha") {           // corpus: leaky_relu_buggy — leaks instead of clamping
+      const out = V.bgemmJS(x.q, wq, x.s, ws, { ...d, relu: false }, L);
+      if (d.relu) for (let i = 0; i < out.length; i++) if (out[i] < 0) out[i] = Math.fround(out[i] * 0.1);
+      return out;
+    }
     return V.bgemmJS(x.q, wq, x.s, ws, d, L);
   };
 }
@@ -102,6 +123,39 @@ const PROPS = {
       for (let j = 0; j < d.n; j++) if (o2[1 * d.n + j] !== base[1 * d.n + j]) { moved = true; break; }
       if (!moved) return `A[.,${p}] does not affect its output row`;
     }
+    return null;
+  },
+  // relu(x) >= 0 is part of the DEFINITION when the fused ReLU is on — a range
+  // constraint, not a relation. Catches a wrong negative slope, which every
+  // relation survives (the structure of a leak is fine; its sign is not).
+  async reluRange(K) {
+    const d = { m: 6, k: 32, n: 5, batch: 1, relu: true };
+    const out = await K(randf(d.m * d.k), randf(d.k * d.n), d);
+    for (let i = 0; i < out.length; i++)
+      if (out[i] < 0) return `negative output ${out[i]} at [${(i / d.n) | 0},${i % d.n}] under fused ReLU`;
+    return null;
+  },
+  // With unit scales the dequant is the identity, so the definition pins
+  // ABSOLUTE values: out must equal the exact integer dot product. No RELATION
+  // can catch a uniform c× — if out satisfies every relation, c·out does too —
+  // so the suite needs one point where the spec fixes the scale. Inputs are
+  // floats that quantize exactly (row/col absmax = 127 ⇒ scale 1), and the
+  // expected values are plain integer arithmetic: no reference implementation.
+  async unitScaleAnchor(K) {
+    const d = { m: 2, k: 4, n: 2, batch: 1 };
+    const A = Float32Array.from([127, 1, -2, 3,
+                                 0, 5, -127, 2]);
+    const B = Float32Array.from([127, 3,        // k×n, each COLUMN has absmax 127
+                                 -1, 127,
+                                 2, -5,
+                                 0, 1]);
+    const out = await K(A, B, d);
+    for (let i = 0; i < d.m; i++)
+      for (let j = 0; j < d.n; j++) {
+        let dot = 0;
+        for (let p = 0; p < d.k; p++) dot += A[i * d.k + p] * B[p * d.n + j];
+        if (out[i * d.n + j] !== dot) return `unit-scale output [${i},${j}] = ${out[i * d.n + j]}, definition says ${dot}`;
+      }
     return null;
   },
   // a zero row of A must produce a zero row of output, whatever the scales are
@@ -182,6 +236,12 @@ const PROPS = {
   const accPerm = await PROPS.rowPermutation(makeKernel("accOverwrite"));
   ok(accSens !== null, `sensitivity catches acc= instead of acc+=  (${accSens || "MISSED"})`);
   console.log(`  note   rowPermutation vs that same acc= bug: ${accPerm ? "caught" : "missed — it is structure-preserving, which is the whole trap"}`);
+  // value bugs: invisible to every RELATION (c·out satisfies whatever out
+  // does), caught by the definitional absolutes — range and unit-scale anchor
+  const leakBad = await PROPS.reluRange(makeKernel("leakyAlpha"));
+  ok(leakBad !== null, `reluRange catches a wrong leaky slope  (${leakBad || "MISSED"})`);
+  const facBad = await PROPS.unitScaleAnchor(makeKernel("factor2"));
+  ok(facBad !== null, `unitScaleAnchor catches a uniform 2x  (${facBad || "MISSED"})`);
 
   console.log(pass ? "\nMETAMORPHIC TEST PASSED" : "\nMETAMORPHIC TEST FAILED");
   process.exit(pass ? 0 : 1);

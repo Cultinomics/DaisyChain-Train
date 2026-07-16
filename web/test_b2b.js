@@ -44,10 +44,15 @@ const ok = (c, msg) => { console.log(`${c ? "  ok  " : "  FAIL"}  ${msg}`); if (
     }
     ok(bad === 0, `scales from the fused absmax are bit-identical to quantizeRows (${n} rows incl. zero rows)`);
   }
-  // 2) the respec moves an int8 by at most ONE step
+  // 2) the respec moves an int8 by at most ONE step — and must move at least
+  //    one somewhere, or every "bit-identical to the mirror" claim downstream
+  //    is untested. Boundary hits are ~1 in 10^5 values, so scan ADAPTIVELY:
+  //    keep drawing until one is found (a fixed small sample made this test
+  //    flip a coin — it failed 2 runs in 3, which is its own lesson about
+  //    asserting the existence of rare events from bounded randomness).
   {
     let maxd = 0, diff = 0, n = 0;
-    for (let t = 0; t < 200; t++) {
+    while (diff === 0 && n < 3_000_000) {
       const rows = 1 + (Math.random() * 30 | 0), cols = 1 + (Math.random() * 70 | 0);
       const X = rnd(rows * cols);
       const old = V.quantizeRows(X, rows, cols);
@@ -60,10 +65,8 @@ const ok = (c, msg) => { console.log(`${c ? "  ok  " : "  FAIL"}  ${msg}`); if (
         if (d > maxd) maxd = d;
       }
     }
-    ok(maxd <= 1, `respecced quantize differs by at most 1 step (max ${maxd}; ${diff}/${n} = ${(100 * diff / n).toFixed(3)}% of values moved)`);
-    // and it must differ SOMEWHERE: if the respec silently became the old
-    // spec, every "bit-identical to the mirror" claim downstream is untested
-    ok(diff > 0, `the respec is a real change (${diff} boundary values moved) — the mirror equivalence is not vacuous`);
+    ok(maxd <= 1, `respecced quantize differs by at most 1 step (max ${maxd} over ${n} values)`);
+    ok(diff > 0, `the respec is a real change (${diff} boundary value(s) in ${n} scanned) — the mirror equivalence is not vacuous`);
   }
   // 3) chain == its parts, and gemm1 is byte-identical to the un-chained GEMM
   {

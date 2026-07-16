@@ -129,6 +129,36 @@ function propertySuite(K) {
       if (!moved) return `sensitivity(A[.,${p}] ignored)`;
     }
   }
+  // RELU RANGE. relu(x) >= 0 is part of the kernel's DEFINITION when the
+  // fused ReLU is on — a range constraint, not a relation between calls.
+  // This is what catches a wrong negative slope: the structure survives a
+  // leak, the sign does not.
+  {
+    const d = { ...SHAPES, relu: true };
+    const A = randf(d.m * d.k), B = randf(d.k * d.n);
+    const o = call(K, A, B, d);
+    for (let i = 0; i < o.length; i++) if (o[i] < 0) return "reluRange";
+  }
+  // UNIT-SCALE ANCHOR. With rs = cs = 1 the dequant is the identity, so the
+  // definition pins ABSOLUTE values: out must equal the exact integer dot
+  // product (f32-exact far below 2^24). No RELATION can do this — if out
+  // satisfies every relation, so does c*out — so the suite needs one point
+  // where the spec fixes the scale. Expected values come from plain integer
+  // arithmetic: no reference implementation, no LUT, no mirror.
+  {
+    const d = { m: 3, k: 5, n: 4, batch: 1 };
+    const Xq = new Int8Array(d.m * d.k), Wq = new Int8Array(d.k * d.n);
+    for (let i = 0; i < Xq.length; i++) Xq[i] = ((i * 37 + 11) % 25) - 12;
+    for (let i = 0; i < Wq.length; i++) Wq[i] = ((i * 53 + 7) % 25) - 12;
+    const rs = new Float32Array(d.m).fill(1), cs = new Float32Array(d.n).fill(1);
+    const o = K(Xq, Wq, rs, cs, d);
+    for (let i = 0; i < d.m; i++)
+      for (let j = 0; j < d.n; j++) {
+        let dot = 0;
+        for (let p = 0; p < d.k; p++) dot += Xq[i * d.k + p] * Wq[p * d.n + j];
+        if (o[i * d.n + j] !== dot) return "unitScaleAnchor";
+      }
+  }
   // zero row of A -> zero row out
   {
     const d = { ...SHAPES };
