@@ -93,6 +93,45 @@ restore the whole group after a failure.
 
 **Live demo:** https://huggingface.co/spaces/Quazim0t0/DaisyChain-Web
 
+### Recent updates (July 2026) — DaisyChain-Web
+
+**Verification stack** — the browser trainer's correctness is now *checked by
+things that run*, not argued ([full results](web/TEST_RESULTS.md)):
+- **IEEE-754 oracle** (`web/test_ieee.js`): a binary32 oracle built from the
+  standard in exact BigInt arithmetic proves the JS epilogue mirror is
+  spec-correct — and rejects the old round-once mirror on 34% of inputs.
+- **Metamorphic properties + oracle mutation scoring** (`test_metamorphic.js`,
+  `test_corpus.js`): properties needing no reference implementation, then
+  scored against an externally-authored bug taxonomy — properties catch 2/2
+  loop bugs, the exact differential gate catches 4/4.
+- **Exact kernel gates on every live kernel**, a continuous random-cell audit
+  at live shapes, and a cross-device kernel probe (same seeded int8 GEMM,
+  same hash on every honest device, any backend).
+
+**Training data** — FineWeb-Edu (10BT sample) is the hardcoded dataset. The
+Space reads random slices of the parquet shards straight off the HF CDN with
+range requests (pure-JS `hyparquet`, SNAPPY) and serves plain text at `/data`
+— no dependency on the datasets-server rows API and its 503s.
+
+**Resilience** — the sync guard now *repairs* instead of halting: a roster
+gradient that reached the leader but not some follower (asymmetric WebRTC
+mesh) is re-requested from the leader, bit-exact, and the run continues. The
+guard still stops anything that would fork the weights.
+
+**CUTLASS-style kernel work**, each step proven bit-identical or exact-gated:
+- **Dispatch-optimized backward** (ex. 05/24): independent GEMMs overlapped,
+  sibling trios fused into batch-3 dispatches — bit-identical gradients,
+  dormant int8-backward path down from 1.63× to 1.21× vs float.
+- **QKV dual-GEMM fusion** (ex. 45): q/k/v share one left operand — quantized
+  once, one batched dispatch, zero changed bits.
+- **B2B MLP chain** (ex. 13 + 23): both MLP GEMMs back-to-back on the GPU with
+  a fused per-row absmax reduction; the intermediate is quantized on-device
+  via a WGSL-exact respec (`floor(f32(x·invScale)+0.5)` — no GPU division)
+  whose fround-stepped JS mirror keeps mixed GPU/CPU fleets bit-identical.
+
+All ten test suites (`cd web && npm test`) pass; results with methodology in
+[`web/TEST_RESULTS.md`](web/TEST_RESULTS.md).
+
 ---
 
 ## How it works
