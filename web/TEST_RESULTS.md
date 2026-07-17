@@ -1,6 +1,6 @@
-# Test results — updated 2026-07-16
+# Test results — updated 2026-07-17
 
-All suites run with `npm test` (chains all ten). Every suite exits 0.
+All suites run with `npm test` (chains all eleven). Every suite exits 0.
 Hardware for GPU numbers: NVIDIA via WebGPU, DP4A int8 dot path, exact-gated
 against the verified units at init.
 
@@ -11,7 +11,8 @@ against the verified units at init.
 | `test_ieee.js` | the JS epilogue mirror is IEEE-754 spec-correct, not merely agreeable | PASS — 500k+ checks, 0 disagreements; rejects the old round-once mirror on 34% of inputs |
 | `test_gates.js` | the exact kernel gate rejects real bugs, accepts the real kernel | PASS — 5/5 injected bugs rejected, clean kernel accepted, audit sees the sign of zero |
 | `test_metamorphic.js` | correctness properties that need no reference implementation | PASS — 6/6 properties hold; catches stride/swap/acc= mutants |
-| `test_corpus.js` | mutation-scores the oracles with an external bug taxonomy | PASS — properties 2/4 (2/2 loop, 0/2 math), differential 4/4, control clean |
+| `test_corpus.js` | mutation-scores the oracles with an external bug taxonomy | PASS — properties 4/4 (2/2 loop, 2/2 math), differential 4/4, control clean |
+| `test_selfcorpus.js` | scores every instrument against MY OWN four bugs from July 2026 | PASS — properties 0/2, differential 2/2, metaTest 1/1, liveness 1/1 |
 | `test_optimizer.js` | DaisyAdam beats SGD through the units, deterministic replicas | PASS — 1.59 vs 1.95, replica diff 0.000e+0 |
 | `test_transformer.js` | the transformer LM trains through the units end to end | PASS — loss 4.75 → 1.26 (baseline 4.56), replica diff 0.000e+0 |
 | `test_unit_backward.js` | int8 STE gradients do not damage convergence | PASS — units/float loss ratio 1.007 |
@@ -58,6 +59,31 @@ integer arithmetic — no LUT, no mirror) pins absolute scale and catches the
 uniform 2×. Still no reference implementation anywhere in the property suite;
 the suite is now relations for the loop plus spec-pinned absolutes for the
 values, and the differential gate remains an independent second opinion.
+
+## Scoring my own bugs (`test_selfcorpus.js`)
+
+The external corpus measures the oracles against kernel bugs someone else
+wrote down. But this month's four REAL bugs (each with a name and a fix) are
+a different population:
+
+| bug | lives in | properties | differential | metaTest | liveness |
+|---|---|---|---|---|---|
+| stripped binding (scales ignored) | data/scale | MISSED | CAUGHT | — | — |
+| round-once sum (wrong rounding schedule) | data/rounding | MISSED | CAUGHT | — | — |
+| dead gate (vacuous pass) | the checker | — | — | CAUGHT | — |
+| roster-gradient stall | the protocol | — | — | — | CAUGHT |
+
+Properties score **0/2** on the data-plane pair — the c·out theorem again:
+one bug is a per-column scalar, the other a last-ulp rounding change, and the
+unit-scale anchor sits exactly where both are invisible. The differential
+gate catches both. But half the bugs did not live in the kernels at all: the
+dead gate is a bug in a CHECKER (only mutation-testing the gate sees it), and
+the stall is a bug in the PROTOCOL (every computed value on every peer was
+correct, so no data oracle can fire — a liveness simulation with an
+asymmetric gradient drop catches it, and verifies the repair protocol
+finishes with identical weights). The instruments that caught this month's
+bugs are not better oracles; they are different instruments. The population
+defines the instrument, not the other way round.
 
 ## Backward rework: bit-identity + GPU wall clock
 
