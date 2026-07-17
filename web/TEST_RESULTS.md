@@ -50,6 +50,14 @@ The oracle now also covers **addition** and **fused multiply-add**:
   implementations of the same paragraph of the standard, zero disagreements.
   Fused really is different: it differs from the round-twice composition on
   100% of cancellation cases.
+- **Mul and add carry the same cross-check** (`test_vectors_fp32.json`):
+  6004 vectors computed by neural-rdna2's **LUT-backed verified fp32 core** —
+  the RDNA2 wave interpreter's own arithmetic, every mantissa product through
+  the exported mul4 atom — over epilogue-shaped ranges, subnormal/overflow
+  regimes, raw finite bits, and signed zeros. `mulF32Spec` and `addF32Spec`
+  agree bit-for-bit on all of them. Three independent implementations now
+  concur on the epilogue's arithmetic: this BigInt oracle, V8's fround, and a
+  verified-unit RDNA2 core.
 - The fma-contraction immunity claim now stands on checked facts instead of
   arguments: on the quantize domain the f64 emulation used by `test_b2b.js`
   equals the true fma (300k draws), and the floor-invisibility result holds
