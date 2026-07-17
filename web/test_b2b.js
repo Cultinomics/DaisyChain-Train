@@ -68,6 +68,31 @@ const ok = (c, msg) => { console.log(`${c ? "  ok  " : "  FAIL"}  ${msg}`); if (
     ok(maxd <= 1, `respecced quantize differs by at most 1 step (max ${maxd} over ${n} values)`);
     ok(diff > 0, `the respec is a real change (${diff} boundary value(s) in ${n} scanned) — the mirror equivalence is not vacuous`);
   }
+  // 2b) fma-contraction immunity: WGSL permits contracting `x*inv + 0.5` into
+  //     a hardware FMA (one rounding, e.g. RDNA2 V_FMA_F32), and no gate can
+  //     forbid the compiler that choice. Prove it cannot matter: fused and
+  //     stepped rounding differ only in the last ulp at binade crossings, and
+  //     the RNE tie parity keeps both on the same side of every integer — so
+  //     floor(), hence the int8, is identical. Assert (a) raw last-ulp
+  //     differences DO occur (the claim is about floor, not vacuous absence
+  //     of anomalies) and (b) not one of them survives floor.
+  {
+    const f32 = Math.fround;
+    let raw = 0, fl = 0, n = 0;
+    for (let k = 1; k <= 7; k++) {                 // binade edges 2..128, from below and above
+      const u = Math.pow(2, k - 23);
+      for (let t = 0; t < 400000; t++) {
+        n++;
+        const iv = f32(0.25 + Math.random() * 500);
+        const x = f32((Math.pow(2, k) - 0.5 + (Math.random() * 8 - 6) * u) / iv);
+        const p = x * iv;                           // f32×f32 is exact in f64 -> true fused input
+        const two = f32(f32(p) + 0.5), fused = f32(p + 0.5);
+        if (two !== fused) { raw++; if (Math.floor(two) !== Math.floor(fused)) fl++; }
+      }
+    }
+    ok(raw > 0, `fused-vs-stepped last-ulp differences occur at binade edges (${raw} in ${n} draws) — the immunity claim is not vacuous`);
+    ok(fl === 0, `none survives floor(): the +0.5 quantize is fma-contraction-immune (0/${raw} floor-visible)`);
+  }
   // 3) chain == its parts, and gemm1 is byte-identical to the un-chained GEMM
   {
     const d = { m: 17, k: 32, h: 20, n: 9 };
