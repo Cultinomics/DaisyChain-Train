@@ -32,7 +32,9 @@ function inputs(d) {
   return { Xq, Wq, rs, cs };
 }
 
-// exact gate: int32 accumulator with !==, then f32 epilogue with !==
+// exact gate: int32 accumulator with !==, then f32 epilogue compared AT THE
+// BIT LEVEL (V.bitDiff) — `!==` can't see -0 vs +0, and the fleet's replica
+// checks hash raw bytes, so the gate must compare what the hash sees.
 function gateExact(kernel, shapes) {
   for (const d of shapes) {
     const { Xq, Wq, rs, cs } = inputs(d);
@@ -41,7 +43,7 @@ function gateExact(kernel, shapes) {
     for (let i = 0; i < accRef.length; i++) if (accHw[i] !== accRef[i]) return `acc @${i}`;
     const hw = kernel(Xq, Wq, rs, cs, d, L);
     const ref = V.bgemmJS(Xq, Wq, rs, cs, d, L);
-    for (let i = 0; i < ref.length; i++) if (hw[i] !== ref[i]) return `epilogue @${i}`;
+    for (let i = 0; i < ref.length; i++) if (V.bitDiff(hw[i], ref[i])) return `epilogue @${i}`;
   }
   return null;
 }
@@ -112,6 +114,26 @@ ok(oldMissedRounding && newCatchesRounding,
    "f64-vs-f32 epilogue rounding: allclose PASSES it, exact gate catches it");
 const oldMissedStride = gateOld(mutant("batchStride")) === null;
 console.log(`  note   batchStride under the old gate: ${oldMissedStride ? "MISSED" : "caught (batch>1 was in the shape)"}`);
+
+// ---- the sign of zero -------------------------------------------------------
+// Real ISAs have non-IEEE modes that flush -0 to +0 (RDNA2 output modifiers /
+// DX9-legacy multiplies). JS `!==` treats -0 === 0, so a value-level gate is
+// BLIND to that flush — yet the sync guard hashes raw bits, so it would fork
+// the fleet. The audit must therefore compare bit patterns.
+console.log("\nthe audit must see the sign of zero (`!==` cannot):");
+{
+  const d = { m: 2, k: 4, n: 2 };
+  const Xq = new Int8Array(d.m * d.k);                        // all zero -> acc = 0 -> epi = +0
+  const Wq = rnd(d.k * d.n, () => (Math.random() * 256 - 128) | 0);
+  const rs = Float32Array.from({ length: d.m }, () => Math.random() + 0.5);
+  const cs = Float32Array.from({ length: d.n }, () => Math.random() + 0.5);
+  const got = V.bgemmJS(Xq, Wq, rs, cs, { ...d, batch: 1 }, L);
+  ok(got.every((v) => !V.bitDiff(v, 0)), "sanity: the units produce +0 here");
+  got[1] = -0;                                                // what a -0-flushing device's INVERSE would look like; either direction diverges the hash
+  ok(got.every((v) => v === 0), "sanity: `!==` cannot tell the corrupted output apart");
+  const bad = V.auditTile(Xq, Wq, rs, cs, d, got, L, 400);    // 400 samples over 4 cells: hits the bad cell w.p. 1-(3/4)^400
+  ok(bad !== null, `auditTile flags the -0 (${bad || "NOT CAUGHT"})`);
+}
 
 console.log(pass ? "\nGATE TEST PASSED — the gate rejects real bugs and accepts the real kernel."
                  : "\nGATE TEST FAILED");
