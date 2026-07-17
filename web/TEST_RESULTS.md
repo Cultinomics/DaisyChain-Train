@@ -131,6 +131,28 @@ pass through the pooled paths, the eleven-suite chain is green, and a full
 300-step live training run completed with a silent audit and no console
 errors.
 
+## LUT vs DP4A: measured, then made a per-device race
+
+A forced-LUT build (the mul LUT is the exported unit's complete extensional
+behavior; DP4A is admitted only because it exact-gates bit-identical to it)
+was benchmarked against the DP4A build, pinned seed, all hashes identical:
+
+| config | DP4A | LUT |
+|---|---|---|
+| c32 float | 221 ms | 222 ms |
+| c32 units | 295 ms | 335 ms |
+| c64 float | 376 ms | 378 ms |
+| c64 units | 425 ms | 475 ms |
+
+First-run numbers were warm-up-skewed (a cold DP4A run read 253/428 on the
+float rows — the moral: never conclude from one run). Stable picture: the
+shipped float path TIES (DP4A's JS packing overhead cancels its dot-hardware
+advantage at these sizes); DP4A is ~12% faster in int8-backward mode. Since
+the ordering is device-dependent in principle and the choice is free
+(bit-identical either way), init now RACES both gated backends at a
+training-like shape (~40ms) and keeps the winner, instead of trusting one
+machine's benchmark. The backend label reports the race result.
+
 ## Backward rework: bit-identity + GPU wall clock
 
 The backward was reworked for dispatch efficiency: independent GEMMs
