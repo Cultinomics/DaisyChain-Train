@@ -166,6 +166,16 @@ three of them on real hardware and exposed one blind spot in our own gates:
   trusting a device model. (Denorm flush is additionally unreachable in the
   shipped math: the 1e-8 scale floor keeps every epilogue product ≥ ~1e-16 in
   magnitude, far above the ~1.2e-38 subnormal threshold.)
+- FMA contraction (`V_FMA_F32`: one rounding, not two) looked like a second
+  hazard — WGSL permits contracting the quantize's `x*inv + 0.5` — but turned
+  out to be an immunity: adding 0.5 is exact except at binade crossings, and
+  there the double-rounding anomaly stays on the same side of every integer
+  (RNE tie parity), so `floor()` — hence the int8 — is identical either way.
+  `test_b2b.js` asserts both halves: last-ulp fused-vs-stepped differences DO
+  occur (~175k per 2.8M edge-targeted draws), and zero survive floor. The
+  `+0.5` respec is contraction-immune by construction; `round(x/scale)` was
+  not. No gate can forbid the compiler an fma, so this had to be a theorem,
+  not a check.
 - The blind spot: RDNA2 has non-IEEE instruction variants a compiler may pick
   — output modifiers and DX9-legacy multiplies that **flush −0 to +0**. Our
   gates compared f32 outputs with JS `!==`, for which `-0 !== 0` is *false*:
