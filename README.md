@@ -38,6 +38,108 @@ it is **not** a substitute for a real GPU on large models. Full envelope in
 
 ---
 
+## Feature list
+
+### Python cluster trainer (`daisychain/`)
+- **Data-parallel training across mixed machines** — each node trains its own
+  shard; gradients combine into the exact full-batch gradient, replicas stay
+  bit-identical.
+- **Capacity-weighted sharding** — faster machines automatically take a
+  bigger share of the batch.
+- **Emulated GPU compute (verified INT8 units)** — `VerifiedLinear` layers
+  run every forward multiply / requantize / ReLU through the bundled trained
+  units; cluster-wide unit-invocation counts printed by rank 0.
+- **Bring your own model** — any `Task` (`build_model` / `sample` / `loss`)
+  via `DAISY_TASK`; template in `examples/my_task_template.py`.
+- **Plain-float alternative task** — same cluster and pooling with ordinary
+  float math.
+- **Live dashboard** (`daisychain-dashboard`) — readiness banner, P2P
+  connectivity scan, pooled cores/RAM, per-node capacity plan, live loss.
+- **SpikeWhale control panel** (`spikewhale_panel`, `localhost:8899`) —
+  sliders for model size / training settings, any HF dataset you can access
+  (default streamed FineWeb-Edu), start/stop/re-adjust, live loss.
+- **Docker demo cluster** — 3 nodes + dashboard in one command.
+- **Windows helper** (`scripts\setup.bat`) and Tailscale mesh guide.
+
+### DaisyChain-Web (`web/`) — browser P2P training
+- **Zero-install nodes** — opening the page IS joining; devices on one
+  network auto-group (Snapdrop-style, by public IP).
+- **Private cross-network rooms** — `?room=CODE` with **host approval** for
+  every join.
+- **Full WebRTC mesh** — gradients travel peer-to-peer; the server only
+  signals and serves static files, it never sees weights or gradients.
+- **Leader-follower runs** — whoever presses Start sets width / sequence /
+  batch-per-device / steps / learning rate for the whole group; config
+  broadcast on the wire.
+- **Mid-run join** — late devices are synced in (weights + step) and
+  contribute from the next step.
+- **Bit-identical replicas** — same seeded init, strict roster-order gradient
+  averaging, deterministic Adam with identical state on every peer; verified
+  live by per-step weight hashes.
+- **Sync guard** — any weight-hash mismatch stops the run instead of
+  training past a fork; the step roster forbids silent partial averages.
+- **Gradient repair** — a follower missing a roster gradient re-requests it
+  from the leader (8 steps retained), bit-exact, and the run continues.
+- **Cross-device kernel probe** — every step, every device re-hashes a fixed
+  seeded int8 GEMM through its live kernel; catches broken arithmetic that
+  weight hashes cannot see.
+- **Hardcoded FineWeb-Edu streaming** — the server reads random slices of
+  the 10BT parquet shards straight off the HF CDN via HTTP range requests
+  (pure-JS `hyparquet`); built-in corpus fallback offline.
+- **Checkpoints** — download `.pt`, upload → **broadcast to the whole
+  group**; validated (magic, dims, tokenizer vocab) before accepting.
+- **Inference kit** — one self-contained HTML file with the trained weights
+  baked in; generations offline, anywhere.
+- **In-page generation** — prompt box on the trained model.
+- **Old-hardware tier** — no WebGPU? The identical units run on CPU (same
+  bits, so CPU and GPU devices co-train in one group). There is no
+  plain-float path.
+- **Large-message fragmentation** — multi-MB gradients/checkpoints chunked
+  at 48 KB over the data channels.
+
+### Verified compute & kernels (web)
+- **Verified INT8 units everywhere** — block-scaled int8 GEMM: exact LUT
+  products, exact int32 accumulation, bit-exact f32 epilogue with a pinned
+  rounding schedule; scales derived in JS f64 (division never runs on GPU).
+- **Backends, best-first** — DP4A hardware int8 dot → LUT compute shader →
+  CPU mirror; every kernel **exact-gated at init** (bit-level compares) and
+  demoted to the mirror on any mismatch.
+- **Continuous random-cell audit** at live training shapes.
+- **Fused attention kernels** — gather/scatter head-strided q·kᵀ and a·v
+  straight from BT×C layout (CUTLASS ex. 36/52 style).
+- **QKV dual-GEMM fusion** — shared left operand quantized once, one batch-3
+  dispatch (ex. 45); bit-identical.
+- **B2B MLP chain** — both MLP GEMMs back-to-back on GPU with fused per-row
+  absmax reduction and on-device quantize (ex. 13 + 23); WGSL-exact respec
+  with a fround-stepped JS mirror; fma-contraction-immune by construction.
+- **Dispatch-optimized backward** — overlapped independent GEMMs, batch-3
+  sibling fusions (ex. 05/24); bit-identical gradients; optional int8 STE
+  backward path (dormant, 1.21× vs float).
+
+### Verification stack (web)
+- **Exact init gates** on every kernel, every device, every boot — including
+  gates that "gate the gate" with discriminating boundary inputs.
+- **IEEE-754 binary32 oracle** in exact BigInt arithmetic — proves the JS
+  epilogue mirror is spec-correct (rejects the old mirror on 34% of inputs).
+- **Metamorphic property suite** — reference-free relations + definitional
+  absolutes; **4/4** on an externally-authored bug corpus, matching the
+  differential gate.
+- **RDNA2 ISA audit hardenings** — bit-level (−0-aware) gate comparisons;
+  proof that FMA contraction cannot change the quantize.
+- **Ten-suite test chain** (`cd web && npm test`) — convergence, replicas,
+  oracle, gates, properties, corpus, B2B, optimizer, transformer LM, int8
+  backward; results in [web/TEST_RESULTS.md](web/TEST_RESULTS.md).
+
+### Documentation
+- Python: [QUICKSTART](docs/QUICKSTART.md), [LIMITS](docs/LIMITS.md),
+  [CUSTOM_TASK](docs/CUSTOM_TASK.md), [TAILSCALE](docs/TAILSCALE.md).
+- Web: [Getting started](web/docs/GETTING_STARTED.md),
+  [Architecture](web/docs/ARCHITECTURE.md),
+  [Verification](web/docs/VERIFICATION.md),
+  [Troubleshooting](web/docs/TROUBLESHOOTING.md).
+
+---
+
 ## Quick start
 
 ### Docker (most reliable — one command)
