@@ -1,3 +1,15 @@
+---
+title: DaisyChain-Web
+emoji: 🌼
+colorFrom: green
+colorTo: yellow
+sdk: docker
+app_port: 7860
+pinned: false
+license: mit
+short_description: Train a shared model P2P by opening a browser tab
+---
+
 # 🌼 DaisyChain-Web — train by opening a page
 
 Part of **DaisyChain** → https://huggingface.co/DaisyChainAI
@@ -11,6 +23,12 @@ average gradients directly between peers.
 
 > This is the browser-native version of DaisyChain: instead of setting up nodes,
 > people join a training run by opening a URL.
+
+**Docs:** [Getting started](docs/GETTING_STARTED.md) ·
+[Architecture](docs/ARCHITECTURE.md) ·
+[Verification (why the numbers are trustworthy)](docs/VERIFICATION.md) ·
+[Troubleshooting](docs/TROUBLESHOOTING.md) ·
+[Test results](TEST_RESULTS.md)
 
 ## Run it
 
