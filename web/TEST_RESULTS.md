@@ -107,6 +107,30 @@ finishes with identical weights). The instruments that caught this month's
 bugs are not better oracles; they are different instruments. The population
 defines the instrument, not the other way round.
 
+## Buffer pooling (GPU wall clock, zero math change)
+
+Every dispatch used to create and destroy its GPU buffers (~19 per MLP chain
+call, per layer, per step). They are now recycled through a size-bucketed
+pool. Two hazards were found and handled, one by review and one by the bench:
+a pooled buffer is not zero-initialized (the rowmax atomicMax accumulator is
+now cleared in the encoder), and a bucketed readback maps more bytes than the
+logical result (all six readbacks now map exactly the logical range — the
+bench caught this as an out-of-bounds on the first pooled run).
+
+A/B bench, same pinned seed, prepool baseline vs pooled build (DP4A, NVIDIA):
+
+| config | prepool | pooled | grad hash | loss-sequence hash |
+|---|---|---|---|---|
+| c32 t32, float | 269 ms | 253 ms | `7ff11308` = | `37c1cdec` = |
+| c32 t32, units | 342 ms | 315 ms | `62596547` = | `37c1cdec` = |
+| c64 t48, float | 472 ms | 428 ms | `4f8c378` = | `652498b6` = |
+| c64 t48, units | 510 ms | 460 ms | `9add4284` = | `652498b6` = |
+
+6–10% wall clock, every hash bit-identical to the baseline. All init gates
+pass through the pooled paths, the eleven-suite chain is green, and a full
+300-step live training run completed with a silent audit and no console
+errors.
+
 ## Backward rework: bit-identity + GPU wall clock
 
 The backward was reworked for dispatch efficiency: independent GEMMs
