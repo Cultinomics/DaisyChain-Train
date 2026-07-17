@@ -222,6 +222,10 @@ function differentialGate(K) {
   return null;
 }
 
+// the oracles are reusable: test_selfcorpus.js scores them against MY OWN bugs
+module.exports = { propertySuite, differentialGate, quantize, call, kernel };
+if (require.main !== module) return;
+
 // ---- run --------------------------------------------------------------------
 console.log("\nBugs from dipankarsarkar/gpuemu-corpus, re-injected into my kernel.");
 console.log("Scoring the ORACLES, not the kernel.\n");
