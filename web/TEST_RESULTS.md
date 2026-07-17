@@ -8,7 +8,7 @@ against the verified units at init.
 |---|---|---|
 | `test_core.js` | float trainer converges, replicas bit-identical | PASS — loss 33.71 → 0.000000, replica diff 0.000e+0 |
 | `test_verified.js` | training THROUGH the int8 units converges, replicas bit-identical | PASS — loss 300.6 → 1.41, replica diff 0.000e+0 |
-| `test_ieee.js` | the JS epilogue mirror is IEEE-754 spec-correct, not merely agreeable | PASS — 500k+ checks, 0 disagreements; rejects the old round-once mirror on 34% of inputs |
+| `test_ieee.js` | the JS epilogue mirror is IEEE-754 spec-correct, not merely agreeable | PASS — 1.4M+ checks (mul, add, fma), 0 disagreements; rejects the old round-once mirror on 34% of inputs; agrees bit-for-bit with an independent big-int fma golden on 8000 vectors |
 | `test_gates.js` | the exact kernel gate rejects real bugs, accepts the real kernel | PASS — 5/5 injected bugs rejected, clean kernel accepted, audit sees the sign of zero |
 | `test_metamorphic.js` | correctness properties that need no reference implementation | PASS — 6/6 properties hold; catches stride/swap/acc= mutants |
 | `test_corpus.js` | mutation-scores the oracles with an external bug taxonomy | PASS — properties 4/4 (2/2 loop, 2/2 math), differential 4/4, control clean |
@@ -33,6 +33,28 @@ the oracle REJECTS the round-once mirror shipped before: 68314/200000 inputs (34
 
 That last line is the teeth: an oracle that never disagrees with anything
 proves nothing. This one rejects the exact bug the old `1e-6` tolerance hid.
+
+The oracle now also covers **addition** and **fused multiply-add**:
+
+- `addF32Spec` (exact BigInt sum, one rounding) certifies that `fround(a+b)`
+  is the correctly-rounded f32 sum (Figueroa: 53 ≥ 2·24+2 makes the double
+  rounding innocuous for add) — the fact every per-add mirror schedule in the
+  codebase stands on. 300k draws including extreme exponent gaps, 0
+  disagreements.
+- `fmaF32Spec` (exact product, never rounded, plus addend, ONE rounding) —
+  ported from the neural-rdna2 project's from-the-definition fma golden,
+  which correctly rejects the float64 shortcut (it double-rounds on rare
+  ties). Cross-checked **bit-for-bit against that independent Python
+  implementation on 8000 generated vectors** (quantize-domain, catastrophic
+  cancellation, raw finite bit patterns): two oracles, two codebases, two
+  implementations of the same paragraph of the standard, zero disagreements.
+  Fused really is different: it differs from the round-twice composition on
+  100% of cancellation cases.
+- The fma-contraction immunity claim now stands on checked facts instead of
+  arguments: on the quantize domain the f64 emulation used by `test_b2b.js`
+  equals the true fma (300k draws), and the floor-invisibility result holds
+  against the true fma at the binade edges (66k last-ulp diffs, 0
+  floor-visible).
 
 ## Oracle mutation scores (`test_corpus.js`)
 
