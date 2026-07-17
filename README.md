@@ -109,6 +109,18 @@ things that run*, not argued ([full results](web/TEST_RESULTS.md)):
 - **Exact kernel gates on every live kernel**, a continuous random-cell audit
   at live shapes, and a cross-device kernel probe (same seeded int8 GEMM,
   same hash on every honest device, any backend).
+- **RDNA2 ISA audit**: reading a real GPU's shader ISA against our
+  determinism assumptions confirmed three of them on silicon (exact packed
+  int8 dot; correctly-rounded f32 add/mul; 1-ULP reciprocal — division stays
+  off the GPU) and produced two hardenings. (1) Real ISAs have non-IEEE
+  variants that **flush −0 to +0**; JS `!==` can't see that (`-0 !== 0` is
+  false), so all gates and audits now compare **bit patterns** — exactly what
+  the replica hash sees. (2) FMA contraction of the quantize's `x·inv + 0.5`
+  (one rounding instead of two) turned out to be **floor-invisible by
+  construction** — proven in `test_b2b.js` with 175k+ last-ulp anomalies at
+  binade edges, zero surviving `floor()`. Rounding mode and denorm flushing
+  are runtime driver state on real hardware, which is why every device
+  re-runs the exact gates at every init.
 
 **Training data** — FineWeb-Edu (10BT sample) is the hardcoded dataset. The
 Space reads random slices of the parquet shards straight off the HF CDN with
