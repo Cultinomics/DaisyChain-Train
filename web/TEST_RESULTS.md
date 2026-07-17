@@ -9,7 +9,7 @@ against the verified units at init.
 | `test_core.js` | float trainer converges, replicas bit-identical | PASS — loss 33.71 → 0.000000, replica diff 0.000e+0 |
 | `test_verified.js` | training THROUGH the int8 units converges, replicas bit-identical | PASS — loss 300.6 → 1.41, replica diff 0.000e+0 |
 | `test_ieee.js` | the JS epilogue mirror is IEEE-754 spec-correct, not merely agreeable | PASS — 500k+ checks, 0 disagreements; rejects the old round-once mirror on 34% of inputs |
-| `test_gates.js` | the exact kernel gate rejects real bugs, accepts the real kernel | PASS — 5/5 injected bugs rejected, clean kernel accepted |
+| `test_gates.js` | the exact kernel gate rejects real bugs, accepts the real kernel | PASS — 5/5 injected bugs rejected, clean kernel accepted, audit sees the sign of zero |
 | `test_metamorphic.js` | correctness properties that need no reference implementation | PASS — 6/6 properties hold; catches stride/swap/acc= mutants |
 | `test_corpus.js` | mutation-scores the oracles with an external bug taxonomy | PASS — properties 2/4 (2/2 loop, 0/2 math), differential 4/4, control clean |
 | `test_optimizer.js` | DaisyAdam beats SGD through the units, deterministic replicas | PASS — 1.59 vs 1.95, replica diff 0.000e+0 |
@@ -150,6 +150,31 @@ spec: a searched-for boundary input (int8 68→69 under the respec) run through
 the GPU chain matches the new-spec mirror exactly and differs from the
 old-spec composition. Two-device live run: step 141/300 with identical loss
 (6.23958) on both replicas, per-step weight-hash divergence checks silent.
+
+## The sign of zero (RDNA2 ISA audit)
+
+Reading the RDNA2 shader ISA against our determinism assumptions confirmed
+three of them on real hardware and exposed one blind spot in our own gates:
+
+- `V_DOT4_I32_I8` is an exact packed int8 dot with int32 accumulate — the
+  DP4A path's exactness is an ISA guarantee, not a tested coincidence.
+- f32 add/multiply are 0.5 ULP (correctly rounded) — the epilogue mirror's
+  foundation. `V_RCP_F32` is 1 ULP — division stays off the GPU, as designed.
+- Rounding mode and denorm flushing are **runtime MODE-register state**
+  (`S_ROUND_MODE` / `S_DENORM_MODE`, per wave, driver-controlled) — which is
+  why the exact gates re-run on every device at every init rather than
+  trusting a device model. (Denorm flush is additionally unreachable in the
+  shipped math: the 1e-8 scale floor keeps every epilogue product ≥ ~1e-16 in
+  magnitude, far above the ~1.2e-38 subnormal threshold.)
+- The blind spot: RDNA2 has non-IEEE instruction variants a compiler may pick
+  — output modifiers and DX9-legacy multiplies that **flush −0 to +0**. Our
+  gates compared f32 outputs with JS `!==`, for which `-0 !== 0` is *false*:
+  a −0-flushing kernel would pass every gate, then fork the fleet at the sync
+  guard, which hashes raw bits. All gate and audit comparisons now compare
+  **bit patterns** (`bitDiff`), i.e. exactly what the replica hash sees.
+  `test_gates.js` proves the fix non-vacuously: a `-0` planted where the units
+  produce `+0` is invisible to `!==` (sanity-checked in the test) and flagged
+  by the repaired `auditTile`.
 
 One bug was caught during the rework, by the bit-identity check itself: the
 fused q+k+v sum initially ran in f64 and rounded once, where the old code
