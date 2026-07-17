@@ -185,6 +185,13 @@
   const f32 = Math.fround;
   function epi(s, a, b) { return f32(f32(f32(s) * a) * b); }
 
+  // f32 equality at the BIT level: `!==` says -0 === 0, but replicas are
+  // compared by hashing raw bytes, so an audit that can't see the sign of zero
+  // could pass a device that later forks the fleet. (Real ISAs have non-IEEE
+  // modes that flush -0 to +0 — e.g. RDNA2 output modifiers / legacy muls.)
+  const _fb = new Float32Array(1), _ub = new Uint32Array(_fb.buffer);
+  function bitDiff(a, b) { _fb[0] = a; const u = _ub[0]; _fb[0] = b; return u !== _ub[0]; }
+
   // CPU mirror of the fused GPU kernel: batched int8 GEMM through the LUT with
   // the epilogue (block dequant + optional ReLU) applied before returning —
   // exactly what the WGSL kernel does on-device. d.acc=true returns the raw
@@ -230,8 +237,8 @@
       let v = epi(acc, rs[bz * m + i], cs[bz * n + j]);
       if (relu && v < 0) v = 0;
       const idx = (bz * m + i) * n + j;
-      if (got[idx] !== v)
-        return `GEMM audit failed at [b${bz},${i},${j}] shape ${m}x${k}x${n}: kernel ${got[idx]} vs units ${v}`;
+      if (bitDiff(got[idx], v))
+        return `GEMM audit failed at [b${bz},${i},${j}] shape ${m}x${k}x${n}: kernel ${Object.is(got[idx], -0) ? "-0" : got[idx]} vs units ${Object.is(v, -0) ? "-0" : v}`;
     }
     return null;
   }
@@ -384,7 +391,7 @@
 
   const api = { quantize, quantize2, quantizeRows, quantizeCols, quantizeHeadCols, lutMatmulJS, lutMatmul3JS, lutMatmul3,
                 bgemmJS, vgemmBlock, auditTile, epi, attScoresJS, attCtxJS, linearFwd, forward, backward, splitApply,
-                rowAbsMax, scalesFromAbsMax, quantizeRowsInv, vmlpBlock };
+                rowAbsMax, scalesFromAbsMax, quantizeRowsInv, vmlpBlock, bitDiff };
   if (typeof module !== "undefined" && module.exports) { TC = require("./traincore.js"); module.exports = api; }
   else { TC = root.TrainCore; root.Verified = api; }
 })(typeof self !== "undefined" ? self : this);
