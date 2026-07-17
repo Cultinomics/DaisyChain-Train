@@ -457,6 +457,16 @@
         console.warn("B2B gate: no rounding-boundary input found in 800 trials — respec discrimination unproven this boot (sweep still exact)");
         return null;
       }
+      // FMA-contraction note for the quantize kernel: WGSL permits a compiler
+      // to contract `H*inv + 0.5` into a hardware FMA (e.g. RDNA2 V_FMA_F32 —
+      // ONE rounding instead of two). This CANNOT change the quantized int8:
+      // adding 0.5 is exact except at binade crossings, and there the
+      // double-rounding anomaly only moves the value within the same integer
+      // cell (the RNE tie parity resolves both schedules to the same side of
+      // the integer), so floor() sees no difference. Verified empirically in
+      // test_b2b.js: 48M draws targeted at binade edges, 1.9M last-ulp
+      // fused-vs-stepped differences, ZERO floor-visible. The `+0.5` respec is
+      // contraction-immune by construction — `round(x/scale)` was not.
       const lutMlpEnv = { dp4: false, gemm: bgLutPipe, rowmax: rowmaxPipe, quant: quantI32Pipe, lutBuf };
       let mlpLut = (xq, w1q, w2q, xs, w1s, w2s, d) => gpuMlpChain(device, lutMlpEnv, xq, w1q, w2q, xs, w1s, w2s, d);
       const mlpLutBad = await gateMlp(mlpLut);
