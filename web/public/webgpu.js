@@ -271,6 +271,16 @@
     return out;
   }
 
+  // f32 gate equality AT THE BIT LEVEL. JS `!==` says -0 === 0, but the fleet
+  // compares devices by hashing raw bit patterns (FNV over the byte buffer), so
+  // a kernel that flushes -0 to +0 — real hardware has instructions that do
+  // exactly this (RDNA2 output modifiers and DX9-legacy multiplies are
+  // documented as "not IEEE compatible: -0 is flushed to +0") — would pass a
+  // `!==` gate and still fork the weights at the sync guard. The gates must
+  // compare the same thing the hash sees: the bits.
+  const _fb = new Float32Array(1), _ub = new Uint32Array(_fb.buffer);
+  function bitDiff(a, b) { _fb[0] = a; const u = _ub[0]; _fb[0] = b; return u !== _ub[0]; }
+
   async function initCompute(L) {
     const cpu = { backend: "cpu", label: "CPU (JS)",
                   matmulInt8: (Xq, Wq, m, k, n, LL) => root.Verified.lutMatmulJS(Xq, Wq, m, k, n, LL) };
@@ -342,8 +352,8 @@
           for (let i = 0; i < refAccC.length; i++) if (accC[i] !== refAccC[i]) throw new Error(`ctx accumulator mismatch @${i} shape ${JSON.stringify(d0)}`);
           const refS = root.Verified.attScoresJS(qq, kq, qs, ks, d0, L);
           const refC = root.Verified.attCtxJS(aq, vq, as, vs, d0, L);
-          for (let i = 0; i < refS.length; i++) if (hwS[i] !== refS[i]) throw new Error(`scores epilogue mismatch @${i}`);
-          for (let i = 0; i < refC.length; i++) if (hwC[i] !== refC[i]) throw new Error(`ctx epilogue mismatch @${i}`);
+          for (let i = 0; i < refS.length; i++) if (bitDiff(hwS[i], refS[i])) throw new Error(`scores epilogue mismatch @${i}`);
+          for (let i = 0; i < refC.length; i++) if (bitDiff(hwC[i], refC[i])) throw new Error(`ctx epilogue mismatch @${i}`);
         }
       } catch (e) {
         console.warn("fused attention kernels failed verification — using CPU LUT mirrors:", e.message);
@@ -389,7 +399,7 @@
           const hw = await bgFn(Xq, Wq, rs, cs, d0);
           const ref = root.Verified.bgemmJS(Xq, Wq, rs, cs, d0, L);
           for (let i = 0; i < ref.length; i++)
-            if (hw[i] !== ref[i]) return `epilogue mismatch @${i} (${shape}): ${hw[i]} vs ${ref[i]}`;
+            if (bitDiff(hw[i], ref[i])) return `epilogue mismatch @${i} (${shape}): ${hw[i]} vs ${ref[i]}`;
         }
         return null;
       }
@@ -412,9 +422,9 @@
           const ref = await root.Verified.vmlpBlock(Xf, W1, W2, d0, L, null, null);
           const shape = `${d0.m}x${d0.k}x${d0.h}x${d0.n}`;
           for (let i = 0; i < ref.h1.length; i++)
-            if (hw.h1[i] !== ref.h1[i]) return `h1 mismatch @${i} (${shape}): ${hw.h1[i]} vs ${ref.h1[i]}`;
+            if (bitDiff(hw.h1[i], ref.h1[i])) return `h1 mismatch @${i} (${shape}): ${hw.h1[i]} vs ${ref.h1[i]}`;
           for (let i = 0; i < ref.out.length; i++)
-            if (hw.out[i] !== ref.out[i]) return `out mismatch @${i} (${shape}): ${hw.out[i]} vs ${ref.out[i]}`;
+            if (bitDiff(hw.out[i], ref.out[i])) return `out mismatch @${i} (${shape}): ${hw.out[i]} vs ${ref.out[i]}`;
         }
         // DISCRIMINATING case: the sweep above passes vacuously if no value
         // lands on a rounding boundary — the old round(x/scale) spec would
@@ -439,7 +449,7 @@
           const refNew = V.bgemmJS(qNew, w2.q, sc.scale, w2.s, { m: d1.m, k: d1.h, n: d1.n, batch: 1 }, L);
           const refOld = V.bgemmJS(qOld, w2.q, sc.scale, w2.s, { m: d1.m, k: d1.h, n: d1.n, batch: 1 }, L);
           let eqNew = true, eqOld = true;
-          for (let i = 0; i < refNew.length; i++) { if (gpu.out[i] !== refNew[i]) eqNew = false; if (gpu.out[i] !== refOld[i]) eqOld = false; }
+          for (let i = 0; i < refNew.length; i++) { if (bitDiff(gpu.out[i], refNew[i])) eqNew = false; if (bitDiff(gpu.out[i], refOld[i])) eqOld = false; }
           if (!eqNew) return "discriminating boundary case: GPU chain does not match the respec mirror";
           if (eqOld) return "discriminating boundary case: GPU chain matches the OLD quantize spec";
           return null;                                    // proven: respec, not merely gate-compatible
