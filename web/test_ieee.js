@@ -215,6 +215,31 @@ console.log("\nfmaF32Spec: single rounding, cross-checked against an independent
     console.log("  note   test_vectors_fma.json not present — cross-oracle check skipped");
   }
 
+  // 2b) same cross-check for MUL and ADD — vectors computed by neural-rdna2's
+  //     LUT-BACKED verified fp32 core (the wave interpreter's own arithmetic:
+  //     every mantissa product through the exported mul4 atom, exact
+  //     exponent/round wiring). Epilogue-shaped ranges + subnormal/overflow
+  //     regimes + raw finite bits + signed zeros.
+  {
+    let vecs = null;
+    try { vecs = JSON.parse(fs.readFileSync(path.join(__dirname, "test_vectors_fp32.json"), "utf8")); } catch (e) {}
+    if (vecs) {
+      const buf = new ArrayBuffer(4), dv = new DataView(buf);
+      const fromBits = (u) => { dv.setUint32(0, u); return dv.getFloat32(0); };
+      const toBits = (x) => { dv.setFloat32(0, x); return dv.getUint32(0); };
+      let badM = 0, badA = 0;
+      for (const [ah, bh, mh, sh] of vecs.vectors) {
+        const a = fromBits(parseInt(ah, 16)), b = fromBits(parseInt(bh, 16));
+        if (toBits(mulF32Spec(a, b)) !== parseInt(mh, 16)) badM++;
+        if (toBits(addF32Spec(a, b)) !== parseInt(sh, 16)) badA++;
+      }
+      ok(badM === 0, `mulF32Spec agrees bit-for-bit with the LUT-backed RDNA2 core on ${vecs.vectors.length} vectors`);
+      ok(badA === 0, `addF32Spec agrees bit-for-bit with the LUT-backed RDNA2 core on ${vecs.vectors.length} vectors`);
+    } else {
+      console.log("  note   test_vectors_fp32.json not present — fp32 cross-oracle check skipped");
+    }
+  }
+
   // 3) the b2b immunity scan's fused emulation, validated: on the quantize
   //    domain (x >= 0, x*inv <= ~127.5, addend 0.5) the exact product spans
   //    <= 53 bits including the 0.5, so fround(x*inv + 0.5) IS the true fma
