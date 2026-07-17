@@ -101,9 +101,11 @@ things that run*, not argued ([full results](web/TEST_RESULTS.md)):
   standard in exact BigInt arithmetic proves the JS epilogue mirror is
   spec-correct — and rejects the old round-once mirror on 34% of inputs.
 - **Metamorphic properties + oracle mutation scoring** (`test_metamorphic.js`,
-  `test_corpus.js`): properties needing no reference implementation, then
-  scored against an externally-authored bug taxonomy — properties catch 2/2
-  loop bugs, the exact differential gate catches 4/4.
+  `test_corpus.js`): properties needing no reference implementation, scored
+  against an externally-authored bug taxonomy — **4/4**, matching the exact
+  differential gate's 4/4. Relations own the loop bugs; two definitional
+  absolutes (ReLU output range, a unit-scale integer anchor) own the value
+  bugs no relation can see.
 - **Exact kernel gates on every live kernel**, a continuous random-cell audit
   at live shapes, and a cross-device kernel probe (same seeded int8 GEMM,
   same hash on every honest device, any backend).
