@@ -510,7 +510,7 @@
     enc.copyBufferToBuffer(bufC, 0, read, 0, bytesC);
     device.queue.submit([enc.finish()]);
     await read.mapAsync(GPUMapMode.READ);
-    const out = new Int32Array(read.getMappedRange().slice(0));
+    const out = new Int32Array(read.getMappedRange(0, bytesC).slice(0));   // pooled: map only the logical range
     read.unmap();
     return { out, bufC, read };
   }
@@ -524,7 +524,7 @@
       { binding: 0, resource: { buffer: bufX } }, { binding: 1, resource: { buffer: bufW } },
       { binding: 2, resource: { buffer: lutBuf } }, { binding: 3, resource: { buffer: bufC } },
       { binding: 4, resource: { buffer: bufD } } ], m, n);
-    [bufX, bufW, bufD, r.bufC, r.read].forEach(b => b.destroy());
+    release(device, [bufX, bufW, bufD, r.bufC, r.read]);
     return r.out;
   }
 
@@ -540,7 +540,7 @@
       { binding: 0, resource: { buffer: bufQ } }, { binding: 1, resource: { buffer: bufK } },
       { binding: 2, resource: { buffer: bufQs } }, { binding: 3, resource: { buffer: bufKs } },
       { binding: 4, resource: { buffer: bufO } }, { binding: 5, resource: { buffer: bufD } } ], T, T, B * heads, d.acc);
-    [bufQ, bufK, bufQs, bufKs, bufD, r.bufO, r.read].forEach(b => b.destroy());
+    release(device, [bufQ, bufK, bufQs, bufKs, bufD, r.bufO, r.read]);
     return r.out;
   }
   async function gpuAttCtx(device, pipeline, aq, vq, as, vs, d) {
@@ -554,7 +554,7 @@
       { binding: 0, resource: { buffer: bufA } }, { binding: 1, resource: { buffer: bufV } },
       { binding: 2, resource: { buffer: bufAs } }, { binding: 3, resource: { buffer: bufVs } },
       { binding: 4, resource: { buffer: bufO } }, { binding: 5, resource: { buffer: bufD } } ], T, hd, B * heads, d.acc);
-    [bufA, bufV, bufAs, bufVs, bufD, r.bufO, r.read].forEach(b => b.destroy());
+    release(device, [bufA, bufV, bufAs, bufVs, bufD, r.bufO, r.read]);
     return r.out;
   }
 
@@ -585,9 +585,9 @@
     enc.copyBufferToBuffer(bufO, 0, read, 0, m * n * 4);
     device.queue.submit([enc.finish()]);
     await read.mapAsync(GPUMapMode.READ);
-    const out = new Float32Array(read.getMappedRange().slice(0));
+    const out = new Float32Array(read.getMappedRange(0, m * n * 4).slice(0));   // pooled: logical range only
     read.unmap();
-    [bufA, bufB, bufP, bufD1, bufO, bufD2, read].forEach(b => b.destroy());
+    release(device, [bufA, bufB, bufP, bufD1, bufO, bufD2, read]);
     return out;
   }
 
@@ -605,7 +605,7 @@
     enc.copyBufferToBuffer(bufO, 0, read, 0, bytesO);
     device.queue.submit([enc.finish()]);
     await read.mapAsync(GPUMapMode.READ);
-    const buf = read.getMappedRange().slice(0);
+    const buf = read.getMappedRange(0, bytesO).slice(0);   // pooled: logical range only
     const out = raw ? new Int32Array(buf) : new Float32Array(buf);
     read.unmap();
     return { out, bufO, read };
@@ -623,7 +623,7 @@
       { binding: 2, resource: { buffer: lutBuf } }, { binding: 3, resource: { buffer: bufR } },
       { binding: 4, resource: { buffer: bufS } }, { binding: 5, resource: { buffer: bufO } },
       { binding: 6, resource: { buffer: bufD } } ], m, n, batch, d.acc);
-    [bufX, bufW, bufR, bufS, bufD, r.bufO, r.read].forEach(b => b.destroy());
+    release(device, [bufX, bufW, bufR, bufS, bufD, r.bufO, r.read]);
     return r.out;
   }
 
@@ -645,7 +645,7 @@
       { binding: 0, resource: { buffer: bufX } }, { binding: 1, resource: { buffer: bufW } },
       { binding: 2, resource: { buffer: bufR } }, { binding: 3, resource: { buffer: bufS } },
       { binding: 4, resource: { buffer: bufO } }, { binding: 5, resource: { buffer: bufD } } ], m, n, batch, d.acc);
-    [bufX, bufW, bufR, bufS, bufD, r.bufO, r.read].forEach(b => b.destroy());
+    release(device, [bufX, bufW, bufR, bufS, bufD, r.bufO, r.read]);
     return r.out;
   }
 
@@ -670,7 +670,9 @@
     }
     const bufRs = up(device, xs, SU), bufCs1 = up(device, w1s, SU), bufCs2 = up(device, w2s, SU);
     const bufH = mk(device, m * h * 4, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
-    const bufMX = mk(device, m * 4, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);  // zero-initialized
+    // rowmax accumulates with atomicMax and NEEDS zeros. A fresh buffer was
+    // zero-initialized; a POOLED buffer is not — cleared in the encoder below.
+    const bufMX = mk(device, m * 4, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST);
     const UU = GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST;
     const bufD1 = up(device, new Uint32Array([m, kw1, h, 1]), UU);       // flags=1: fused ReLU
     const bufDM = up(device, new Uint32Array([m, h, 0, 0]), UU);
@@ -680,6 +682,7 @@
                     : [bufA, bufB, env.lutBuf, bufR, bufC, bufO, bufD])
         .map((b, i) => ({ binding: i, resource: { buffer: b } })) });
     const enc1 = device.createCommandEncoder();
+    enc1.clearBuffer(bufMX, 0, m * 4);            // pooled buffer: zero the atomicMax accumulator
     let pass = enc1.beginComputePass();
     pass.setPipeline(env.gemm);
     pass.setBindGroup(0, gemmBind(bufX, bufW1, bufRs, bufCs1, bufH, bufD1));
@@ -696,9 +699,9 @@
     enc1.copyBufferToBuffer(bufMX, 0, readM, 0, m * 4);
     device.queue.submit([enc1.finish()]);
     await Promise.all([readH.mapAsync(GPUMapMode.READ), readM.mapAsync(GPUMapMode.READ)]);
-    const h1 = new Float32Array(readH.getMappedRange().slice(0)); readH.unmap();
+    const h1 = new Float32Array(readH.getMappedRange(0, m * h * 4).slice(0)); readH.unmap();
     // the atomicMax'ed u32 bit patterns ARE the f32 |max| values
-    const mx = new Float32Array(readM.getMappedRange().slice(0)); readM.unmap();
+    const mx = new Float32Array(readM.getMappedRange(0, m * 4).slice(0)); readM.unmap();
     // scale derivation in JS f64 — exactly rounded, identical on every device
     // (WGSL division is 2.5 ULP, which is why it never runs on the GPU)
     const sc = root.Verified.scalesFromAbsMax(mx);
@@ -722,17 +725,52 @@
     enc2.copyBufferToBuffer(bufO, 0, readO, 0, m * n * 4);
     device.queue.submit([enc2.finish()]);
     await readO.mapAsync(GPUMapMode.READ);
-    const out = new Float32Array(readO.getMappedRange().slice(0)); readO.unmap();
-    [bufX, bufW1, bufW2, bufRs, bufCs1, bufCs2, bufH, bufMX, bufD1, bufDM,
-     bufInv, bufHs, bufQ, bufDQ, bufD2, bufO, readH, readM, readO].forEach(b => b.destroy());
+    const out = new Float32Array(readO.getMappedRange(0, m * n * 4).slice(0)); readO.unmap();
+    release(device, [bufX, bufW1, bufW2, bufRs, bufCs1, bufCs2, bufH, bufMX, bufD1, bufDM,
+     bufInv, bufHs, bufQ, bufDQ, bufD2, bufO, readH, readM, readO]);
     return { h1, out };
   }
 
-  function mk(device, size, usage) { return device.createBuffer({ size, usage }); }
+  // ---- buffer pool ------------------------------------------------------------
+  // Every dispatch used to create and destroy its buffers — ~19 create/destroy
+  // pairs per MLP chain call, per layer, per step. Creation cost is pure driver
+  // overhead, and at these GEMM sizes it is a large share of the step. The pool
+  // recycles buffers by (usage, size-bucket): same bytes uploaded, same regions
+  // read, ZERO math change — the kernels only ever index inside the logical
+  // dims, so the stale tail of a bucketed buffer is never read. The one
+  // exception is a buffer a kernel expects ZEROED (the rowmax accumulator):
+  // pooled buffers are NOT fresh, so that one is cleared explicitly in the
+  // encoder (see gpuMlpChain). Correctness is enforced where it always was:
+  // the exact init gates, the live audit, and the per-step probe hash all run
+  // through these pooled paths.
+  const _pools = new WeakMap();                     // device -> Map(key -> free list)
+  function _poolOf(device) {
+    let p = _pools.get(device);
+    if (!p) { p = new Map(); _pools.set(device, p); }
+    return p;
+  }
+  function mk(device, size, usage) {
+    let cap = 256; while (cap < size) cap *= 2;
+    const key = usage + ":" + cap;
+    const list = _poolOf(device).get(key);
+    if (list && list.length) return list.pop();
+    const b = device.createBuffer({ size: cap, usage });
+    b._poolKey = key;
+    return b;
+  }
   function up(device, arr, usage) {
     const b = mk(device, Math.max(16, arr.byteLength), usage);
     device.queue.writeBuffer(b, 0, arr);
     return b;
+  }
+  function release(device, bufs) {
+    const p = _poolOf(device);
+    for (const b of bufs) {
+      if (!b || !b._poolKey) { if (b) b.destroy(); continue; }
+      let list = p.get(b._poolKey);
+      if (!list) { list = []; p.set(b._poolKey, list); }
+      if (list.length < 64) list.push(b); else b.destroy();
+    }
   }
 
   // ---- canonical kernel probe -------------------------------------------------
