@@ -940,6 +940,43 @@
     const cs = Float32Array.from({ length: batch * n }, () => 1);
     return { Xq, Wq, rs, cs, d: { ...PROBE, acc: true } };
   }
+  // ---- transcendental probe ---------------------------------------------------
+  // The kernel probe covers int8 GEMM arithmetic. It does NOT cover the JS
+  // transcendentals, and ECMA-262 does not require Math.exp/log/cos/sin to be
+  // correctly rounded — it calls them "implementation-approximated", so V8,
+  // SpiderMonkey and JSC are all permitted to return different bits.
+  //
+  // One use of them can fork a fleet: weight INIT. Peers build their own
+  // starting weights from a shared seed rather than broadcasting them
+  // (Box-Muller, so Math.log/cos/sin), and one ulp of engine disagreement
+  // means peers begin from different models. The per-step uses (softmax, loss)
+  // cannot fork anything — every peer averages the same received gradient
+  // BYTES, so a differently-rounded local gradient is still a gradient the
+  // whole group then agrees on.
+  //
+  // This hashes the exact f64 bits of those four functions over a fixed grid,
+  // so a browser whose math library differs is IDENTIFIED instead of showing
+  // up later as an unexplained weight-hash mismatch. Cost: microseconds, once.
+  // Detection, not correction — pinning the algorithms would be a fleet-wide
+  // numerics change, and is only worth doing if this ever reports a mismatch.
+  function mathProbe() {
+    const buf = new ArrayBuffer(8), dv = new DataView(buf);
+    let h = 0x811c9dc5;
+    const eat = (x) => {
+      dv.setFloat64(0, x);
+      for (let i = 0; i < 8; i++) { h ^= dv.getUint8(i); h = Math.imul(h, 0x01000193); }
+    };
+    for (let i = 1; i <= 400; i++) {
+      const u = i / 401;                     // (0,1): the Box-Muller domain
+      eat(Math.log(u));
+      eat(Math.cos(2 * Math.PI * u));
+      eat(Math.sin(2 * Math.PI * u));
+      eat(Math.sqrt(-2 * Math.log(u)));      // the exact composite randn uses
+      eat(Math.exp(-u * 12));                // the softmax domain
+    }
+    return h >>> 0;
+  }
+
   async function kernelProbe(compute, L) {
     const { Xq, Wq, rs, cs, d } = probeInputs();
     const out = compute && compute.bgemm
@@ -948,8 +985,12 @@
     let h = 0x811c9dc5;                      // FNV-1a over the exact int32 results
     const b = new Uint8Array(out.buffer, out.byteOffset, out.byteLength);
     for (let i = 0; i < b.length; i++) { h ^= b[i]; h = Math.imul(h, 0x01000193); }
+    // fold in the transcendental hash: same question ("is your arithmetic the
+    // same as mine?"), same broadcast slot, no wire-format change
+    const mh = mathProbe();
+    for (let i = 0; i < 4; i++) { h ^= (mh >>> (i * 8)) & 0xFF; h = Math.imul(h, 0x01000193); }
     return h >>> 0;
   }
 
-  root.Compute = { initCompute, loadLUTs, kernelProbe };
+  root.Compute = { initCompute, loadLUTs, kernelProbe, mathProbe };
 })(self);
