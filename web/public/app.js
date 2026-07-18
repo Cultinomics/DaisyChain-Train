@@ -589,9 +589,16 @@ function packGrad(step, whash, phash, loss, grad) {
 // shows up mid-run rather than never.
 const PROBE_EVERY = 25;                        // steps between probe refreshes
 let probeHash = 0, auditFailure = null;
+// Audit EVERY GEMM, not 2% of them. The old rate was chosen to bound overhead,
+// but the overhead was never measured: an audit costs k multiply-adds per cell
+// in JS, and at live shapes that is 2.8 us for 16 cells — auditing all ~10
+// GEMMs of a step costs ~0.03 ms against a ~320 ms step, under 0.01%. The old
+// 2%/6-cell setting sampled ~1.2 cells per step and bought nothing for it.
+// 12 cells: the first 6 are the structural danger points (see auditTile's
+// stratified sampling), the rest random.
 const gemmAudit = {
-  cells: 6,
-  due: () => Math.random() < 0.02,            // ~2% of GEMMs, a few cells each
+  cells: 12,
+  due: () => true,                            // measured at <0.01% of a step
   fail: (msg) => { if (!auditFailure) { auditFailure = msg; log(`KERNEL AUDIT FAILED: ${msg}`); } },
 };
 async function refreshProbe() {
