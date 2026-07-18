@@ -126,9 +126,13 @@ it is **not** a substitute for a real GPU on large models. Full envelope in
   differential gate.
 - **RDNA2 ISA audit hardenings** — bit-level (−0-aware) gate comparisons;
   proof that FMA contraction cannot change the quantize.
-- **Ten-suite test chain** (`cd web && npm test`) — convergence, replicas,
-  oracle, gates, properties, corpus, B2B, optimizer, transformer LM, int8
-  backward; results in [web/TEST_RESULTS.md](web/TEST_RESULTS.md).
+- **Eleven-suite test chain** (`cd web && npm test`) — convergence, replicas,
+  oracle, gates, properties, external corpus, **self-corpus** (the instruments
+  scored against my own bugs), B2B, optimizer, transformer LM, int8 backward;
+  results in [web/TEST_RESULTS.md](web/TEST_RESULTS.md).
+- **Dirty-buffer gate** — the pool is poisoned before a re-sweep so state bugs
+  (a kernel assuming zeroed memory) are caught deterministically rather than
+  by ordering luck.
 
 ### Documentation
 - Python: [QUICKSTART](docs/QUICKSTART.md), [LIMITS](docs/LIMITS.md),
@@ -245,7 +249,53 @@ guard still stops anything that would fork the weights.
   via a WGSL-exact respec (`floor(f32(x·invScale)+0.5)` — no GPU division)
   whose fround-stepped JS mirror keeps mixed GPU/CPU fleets bit-identical.
 
-All ten test suites (`cd web && npm test`) pass; results with methodology in
+**Profile-driven speed work** — every change below is bit-identical (gradient
+and loss hashes unchanged), so none of it trades correctness for wall clock:
+- **Buffer pooling**: GPU buffers are recycled by size bucket instead of being
+  created and destroyed per dispatch (~19 per MLP call, per layer, per step).
+  **6–10% faster**, every hash unchanged.
+- **Shared-operand embedding GEMMs**: profiling put two f32 backward GEMMs at
+  **55% of the entire step**, and both consumed the same `dlogits` operand —
+  ~17 MB at the 16512-token vocab, uploaded *twice*. One upload, one encoder,
+  one submit: that pair went 205 → 90 ms and the step **12% faster**. The
+  fusion is gated bit-for-bit against the two calls it replaces.
+- **A negative result, kept on purpose**: the remaining hot kernel looked
+  cache-hostile (adjacent lanes wrote 66 KB apart), but making the writes
+  contiguous changed nothing. Two probes explain why — holding the output at
+  17 MB while cutting compute 32× barely moved the time. The logits GEMM is
+  **transfer-bound, not compute-bound**, and the readback cannot be removed
+  because softmax must stay in JS (WGSL's `exp` is not correctly rounded, and
+  a per-vendor `exp` would fork replicas). The real lever there is the
+  vocabulary, not the kernel.
+- **An init backend race was tried and removed**: it tied on the shipped path,
+  cost ~430 ms of init, and made the backend vary between page loads, which
+  silently invalidated three A/B comparisons before it was caught. A knob that
+  changes what you are measuring is worse than a fixed choice.
+
+**Dirty-buffer gate — and the assumption it falsified.** Pooling introduced a
+bug class the gates predate: a pooled buffer is *not* zero-initialized, so a
+kernel that assumes zeros is right on step one and wrong on step two. That is
+a **state** bug, where no single call is wrong and the *sequence* is, which is
+the family no oracle can reach. The assumption was that the gates were blind
+to it. Mutation-testing the gate proved otherwise: deleting the zeroing made
+the plain gate fail at its *second* shape, because the sweep's own shapes
+recycle each other's buffers. The suite had **incidental** coverage nobody
+designed, which is coverage nobody can rely on — shorten the shape list and it
+evaporates with the gate still green. It is now deliberate: the pool is
+poisoned with 1e4-magnitude residue before a re-sweep, so detection no longer
+depends on ordering luck. ~90 ms one-time.
+
+**Scoring the oracles against my OWN bugs** (`web/test_selfcorpus.js`) — the
+external corpus measures kernel bugs someone else wrote down, so this suite
+asks the harder question: what do the instruments score against the four real
+bugs of the month? Properties **0/2** on the data-plane pair (the `c·out`
+theorem again), differential **2/2** — but half the bugs were not in the
+kernels at all. A dead gate is a bug in a *checker*, caught only by mutating
+the gate; a stalled roster gradient is a bug in the *protocol*, where every
+computed value on every peer was correct, so no data oracle could fire. Those
+needed different instruments, not better oracles.
+
+All eleven test suites (`cd web && npm test`) pass; results with methodology in
 [`web/TEST_RESULTS.md`](web/TEST_RESULTS.md).
 
 ---
