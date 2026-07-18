@@ -135,6 +135,52 @@ console.log("\nthe audit must see the sign of zero (`!==` cannot):");
   ok(bad !== null, `auditTile flags the -0 (${bad || "NOT CAUGHT"})`);
 }
 
+// ---- the audit's sampling strategy ------------------------------------------
+// A bounds-guard off-by-one or a pack-tail padding bug corrupts the LAST
+// row/column only. At the live logits shape (n = 16512) that is 1 cell in
+// 16512, so uniformly random sampling essentially never lands on it. The audit
+// now spends its first cells on the structural danger points deliberately.
+// This measures both strategies against that named bug class.
+console.log("\nthe audit must catch a LAST-COLUMN bug (uniform sampling cannot):");
+{
+  const d = { m: 64, k: 16, n: 512 };                 // n wide, like the real unembed
+  const Xq = rnd(d.m * d.k, () => (Math.random() * 256 - 128) | 0);
+  const Wq = rnd(d.k * d.n, () => (Math.random() * 256 - 128) | 0);
+  const rs = Float32Array.from({ length: d.m }, () => Math.random() + 0.5);
+  const cs = Float32Array.from({ length: d.n }, () => Math.random() + 0.5);
+  const good = V.bgemmJS(Xq, Wq, rs, cs, { ...d, batch: 1 }, L);
+
+  const corrupt = () => {                              // last column only
+    const g = Float32Array.from(good);
+    for (let i = 0; i < d.m; i++) g[i * d.n + (d.n - 1)] = 0;
+    return g;
+  };
+  // the OLD strategy: every cell uniform-random
+  const uniformAudit = (got, nCells) => {
+    for (let t = 0; t < nCells; t++) {
+      const i = (Math.random() * d.m) | 0, j = (Math.random() * d.n) | 0;
+      let acc = 0;
+      for (let p = 0; p < d.k; p++) acc += mul[(Xq[i * d.k + p] & 0xFF) * 256 + (Wq[p * d.n + j] & 0xFF)];
+      if (V.bitDiff(got[i * d.n + j], V.epi(acc, rs[i], cs[j]))) return true;
+    }
+    return false;
+  };
+  const TRIALS = 300;
+  let uniHits = 0, stratHits = 0;
+  for (let t = 0; t < TRIALS; t++) {
+    if (uniformAudit(corrupt(), 12)) uniHits++;
+    if (V.auditTile(Xq, Wq, rs, cs, d, corrupt(), L, 12) !== null) stratHits++;
+  }
+  console.log(`  uniform 12 cells : caught ${uniHits}/${TRIALS} audits  (expected ~${(100*(1-Math.pow(1-1/d.n,12))).toFixed(1)}%)`);
+  console.log(`  stratified 12    : caught ${stratHits}/${TRIALS} audits`);
+  ok(stratHits === TRIALS, "stratified sampling catches the last-column bug on EVERY audit");
+  ok(uniHits < TRIALS * 0.25, "uniform sampling misses it almost always — the strategy, not the cell count, is what changed");
+  // and it must not cry wolf on a clean kernel
+  let fp = 0;
+  for (let t = 0; t < TRIALS; t++) if (V.auditTile(Xq, Wq, rs, cs, d, good, L, 12) !== null) fp++;
+  ok(fp === 0, `no false positives on the clean kernel (${TRIALS} audits)`);
+}
+
 console.log(pass ? "\nGATE TEST PASSED — the gate rejects real bugs and accepts the real kernel."
                  : "\nGATE TEST FAILED");
 process.exit(pass ? 0 : 1);
