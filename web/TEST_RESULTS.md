@@ -115,6 +115,92 @@ finishes with identical weights). The instruments that caught this month's
 bugs are not better oracles; they are different instruments. The population
 defines the instrument, not the other way round.
 
+## Shared-operand embedding GEMMs (profile-driven, zero math change)
+
+Profiling a step (wrapping the engine methods, shipped code untouched) put the
+two f32 backward GEMMs at **55% of the entire step** — 204.8 ms across 2 calls:
+
+```
+fgemm (f32 backward)   2 calls   204.8 ms   55.5% of step   <- the pair
+bgemm                  5 calls    99.2 ms   26.9%
+mlp (B2B chain)        2 calls    17.7 ms    4.8%
+att.scores/ctx         4 calls    18.0 ms    4.9%
+JS remainder                      29.2 ms    7.9%
+```
+
+Both GEMMs consume the SAME operand — `dlogits`, which at the 16512-token
+vocab is 256x16512 f32 = **~17 MB** — so the old code uploaded 17 MB twice per
+step and paid two submits and two map round trips. `gpuFgemm2` uploads it
+once, runs both GEMM+reduce chains on one command encoder, submits once, and
+maps both readbacks concurrently. The shader already reads A as either
+`A[row*k+p]` or `A[p*m+row]` (transA), so one flat buffer serves both index
+patterns and no arithmetic changes.
+
+Controlled A/B (one engine init so the same backend serves both arms, same
+session, same seed, arms interleaved, best-of-2):
+
+```
+old (2 separate fgemm calls) : 363.9 ms/step   grad 89b0f76a  loss b3afdb60
+new (fgemm2 shared operand)  : 319.8 ms/step   grad 89b0f76a  loss b3afdb60
+12.1% faster; gradient AND loss hashes bit-identical
+```
+
+The pair itself went 204.8 -> 90.4 ms (2.3x). Init gates the fusion the same
+way everything else is gated: both legs must equal the two calls they replace
+**bit-for-bit** (not a tolerance), exercising transA on one leg and the plain
+path on the other; on any mismatch `fgemm2` is dropped and the old two-call
+path runs. A note on method: the init backend race makes step totals vary
+run-to-run (LUT vs DP4A can win), so uncontrolled before/after numbers are
+not comparable — hence the same-session A/B.
+
+## Where the remaining GPU time goes (a negative result, kept on purpose)
+
+After the shared-operand fix, `bgemm` was the biggest line (~95 ms/step).
+Phase timers inside it found the cost is neither upload nor the JS copy:
+
+```
+upload 1.8 ms | encode 0.3 | submit 0.2 | copy 7.1 | map 108.5 ms  <- GPU wait
+```
+
+The hypothesis was poor memory coalescing: the kernels used `row = gid.x`, so
+lanes in a wave wrote `O[row*n + col]` **n floats apart** — 66 KB at the 16512
+vocab. Swapping so `col` is the fast-varying dim makes the wave's output write
+contiguous, and is bit-identical by construction (same serial k loop, same
+order; only which lane computes which cell moves).
+
+**It bought nothing.** Like-for-like on the same backend, seeded, hashes equal:
+
+```
+row-fast (before): logits 256x32x16512   69.00 ms/call   fnv 3e9d38cb
+col-fast (after) : logits 256x32x16512   69.36 ms/call   fnv 3e9d38cb
+```
+
+So the swap was reverted. Two probes explain why — hold the output at 17 MB
+and cut the compute 32x, and almost nothing changes:
+
+| shape | MACs | output | ms/call |
+|---|---|---|---|
+| logits `256x32x16512` | 135M | 17 MB | 76.8 |
+| `256x1x16512` (1/32 the compute) | 4.2M | 17 MB | **66.9** |
+| `256x16512x32` (same MACs, tiny out) | 135M | 32 KB | 98.3 |
+
+**The logits GEMM is transfer-bound**: ~67 of its 77 ms is moving 17 MB from
+GPU to CPU (~250 MB/s through WebGPU's staging-copy + fence + map path). No
+kernel tuning can reach it. The third row is a separate pathology — a long
+serial k with only 8192 threads starves parallelism, which is why the split-K
+path exists for the backward.
+
+The readback is not removable: softmax must run in JS because WGSL's `exp` is
+not correctly rounded, and a per-vendor `exp` would fork replicas — the same
+constraint that keeps division off the GPU. So the real lever here is not the
+kernel but the **vocabulary**: at c=32 with a 16512-token vocab the unembed is
+528K of ~550K parameters, and its activations (BT x vocab) dominate every
+transfer in the step. A smaller tokenizer would beat any kernel work available.
+
+This section is kept because a measured negative result is worth as much as
+the win above it: it closes off a plausible-sounding direction with numbers
+instead of leaving it to be re-attempted later.
+
 ## Buffer pooling (GPU wall clock, zero math change)
 
 Every dispatch used to create and destroy its GPU buffers (~19 per MLP chain
