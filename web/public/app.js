@@ -601,7 +601,17 @@ const gemmAudit = {
   due: () => true,                            // measured at <0.01% of a step
   fail: (msg) => { if (!auditFailure) { auditFailure = msg; log(`KERNEL AUDIT FAILED: ${msg}`); } },
 };
+// Logged once so a probe mismatch is diagnosable: the probe folds the kernel
+// hash and the JS-transcendental hash together, and this says which library
+// this browser has. Peers whose math hash differs have a different JS engine
+// math implementation, which forks weight INIT (Box-Muller) even when every
+// kernel is perfect.
+let mathHash = 0;
 async function refreshProbe() {
+  if (!mathHash) {
+    mathHash = Compute.mathProbe();
+    log(`JS math library hash: ${mathHash.toString(16)} (peers must match; ECMA-262 does not require exp/log/cos/sin to be correctly rounded)`);
+  }
   try { probeHash = await Compute.kernelProbe(compute, L); }
   catch (e) { log(`kernel probe failed to run: ${e.message}`); }
   return probeHash;
