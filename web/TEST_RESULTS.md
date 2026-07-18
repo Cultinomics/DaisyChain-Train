@@ -153,6 +153,55 @@ path runs. A note on method: the init backend race makes step totals vary
 run-to-run (LUT vs DP4A can win), so uncontrolled before/after numbers are
 not comparable — hence the same-session A/B.
 
+## The dirty-buffer gate (and the assumption it falsified)
+
+Buffer pooling introduced a bug class the gates were built before: a pooled
+buffer is **not zero-initialized**, so a kernel that assumes zeros (the rowmax
+`atomicMax` accumulator does) is correct on step one and wrong on step two.
+That is a **state** bug — no single call is wrong, the *sequence* is — the
+family no oracle can reach, because an oracle is a function of one call.
+
+The premise was that the gate suite is structurally blind to this, since every
+gate runs on first-acquisition (zeroed) memory. **Mutation-testing the gate
+falsified that.** Deleting the `clearBuffer` and re-running:
+
+```
+B2B MLP chain (LUT) failed verification: out mismatch @0 (5x16x6x3)
+                                                          ^ the SECOND shape
+```
+
+The plain gate catches it — not by design, but because the sweep's own four
+shapes recycle each other's buffers (they land in one power-of-2 pool bucket)
+and an uncleared max only grows. The suite had **incidental** dirty coverage
+nobody designed and nobody documented.
+
+Incidental is the problem. It depends on the sweep having ≥2 shapes, on those
+shapes colliding in one bucket, and on residue exceeding the real value.
+Shorten the shape list and the coverage silently evaporates — with the gate
+still green. So the coverage is now deliberate: `poisonPool` runs the chain at
+**1e4 magnitude** first, so the residue dominates any value the gate can
+produce, releases it, then sweeps again. Detection no longer depends on
+ordering luck, and it covers the first shape too.
+
+Verified:
+
+| check | result |
+|---|---|
+| correct kernel, dirty re-gate | admitted (no false positive) |
+| mutant (`clearBuffer` deleted), plain gate | caught at shape 2 (incidental) |
+| mutant, poisoned gate | caught at shape 1 (deliberate) |
+| init cost | 1546 → 1636 ms, **~90 ms one-time** |
+| eleven suites + live 300-step run | green, no console errors |
+
+The re-gate deliberately skips the 800-trial respec hunt — that hunt is about
+the quantize spec and has nothing to do with buffer state, and skipping it is
+what keeps the added cost at 90 ms instead of doubling gate time.
+
+The lesson worth more than the gate: an instrument can have coverage it was
+never designed for, and coverage you did not design is coverage you cannot
+rely on. The only way to find out was to mutate the gate and watch which
+shape it failed on.
+
 ## Where the remaining GPU time goes (a negative result, kept on purpose)
 
 After the shared-operand fix, `bgemm` was the biggest line (~95 ms/step).
