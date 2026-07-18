@@ -153,6 +153,47 @@ path runs. A note on method: the init backend race makes step totals vary
 run-to-run (LUT vs DP4A can win), so uncontrolled before/after numbers are
 not comparable — hence the same-session A/B.
 
+## Two gaps found by auditing the verification itself
+
+Reviewing the instruments (rather than the kernels) turned up two places where
+the standard applied everywhere else had not been applied.
+
+**1. The attention kernels had no live audit.** Every other GPU kernel is
+recomputed against the units at *live* shapes; `att.scores` and `att.ctx` had
+exact init gates and nothing after — the precise gap the audit exists to close,
+left open on the kernels with the trickiest indexing (head-strided gather,
+scatter write-back). `auditAttScores` / `auditAttCtx` now recompute individual
+cells, stratified like the GEMM audit (last head, last token pair, last
+channel first). Both reject a corrupted last-head/last-channel cell and accept
+the clean kernel; a live 300-step run audits every attention dispatch with no
+false positives.
+
+**2. The f32 backward GEMM was gated by `allclose`** (`1e-3`) — the last
+tolerance in a shipped path, and this suite's own mutation test shows allclose
+waving through a real rounding bug. The reason was legitimate: split-K
+accumulates in a different order than a naive reference, so bit-equality
+against *that* reference is impossible. So the reference was rewritten instead:
+`fgemmMirror` reproduces split-K's partition and accumulation order exactly,
+and the gate now compares with `!==`.
+
+That raised a question the code could not answer by reasoning: WGSL permits a
+compiler to contract `s + a*b` into a fused multiply-add (one rounding instead
+of two), which would change the result. Rather than assume, the gate tries both
+schedules and reports which the device implements — and refuses the kernel if
+**neither** matches, since a backward GEMM that is not bit-reproducible sets
+weights the whole fleet is hashed against. Measured here:
+
+```
+split-K f32 GEMM is bit-exact (two-rounding multiply-add schedule)
+```
+
+So this driver does not contract, and the f32 backward is now exactly gated.
+The two schedules are not a distinction without a difference — they disagree
+on 22/24 cells at the gate shape, so the gate is choosing between real
+alternatives. (The same measurement shows split-K disagreeing with a naive
+matmul on 22/24 cells, which is exactly why the tolerance was there and why
+the mirror had to be written.)
+
 ## Fixing the audit's coverage (the weak spot, named and closed)
 
 The live audit's two constants — `cells: 6`, `due: 2% of GEMMs` — were chosen
