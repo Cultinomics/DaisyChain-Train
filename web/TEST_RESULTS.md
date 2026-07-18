@@ -153,6 +153,47 @@ path runs. A note on method: the init backend race makes step totals vary
 run-to-run (LUT vs DP4A can win), so uncontrolled before/after numbers are
 not comparable — hence the same-session A/B.
 
+## Fixing the audit's coverage (the weak spot, named and closed)
+
+The live audit's two constants — `cells: 6`, `due: 2% of GEMMs` — were chosen
+to bound overhead and never justified against a bug class. That sampled ~1.2
+cells per step, ~360 over a 300-step run: a coverage number sitting in exactly
+the seat `allclose` used to occupy.
+
+**The overhead premise was false.** An audit costs `k` multiply-adds per cell
+in JS. Measured at the live logits shape:
+
+```
+ 6 cells:  2.1 us/audit  ->  0.021 ms/step if EVERY GEMM is audited
+16 cells:  2.8 us/audit  ->  0.028 ms/step
+64 cells: 11.6 us/audit  ->  0.116 ms/step
+```
+
+Against a ~320 ms step that is under 0.01%. The 2% rate was throttling
+coverage to save nothing, so the audit now runs on **every** GEMM.
+
+**But the rate was the smaller half.** The bugs that actually occur here —
+a bounds-guard off-by-one, a pack-tail padding bug — corrupt the **last
+row/column only**. Uniform random sampling finds that with probability ~1/n
+per cell, and at the 16512-wide unembed that is never. So sampling is now
+**stratified**: the first 6 cells are the structural danger points (last
+row, last column, all four corners, last batch) chosen deterministically, the
+rest random interior cells for diffuse bugs.
+
+Measured against that named bug class (last column zeroed, n=512, 300 audits):
+
+| strategy | caught |
+|---|---|
+| uniform, 12 cells | **5 / 300** (predicted ~2.3%) |
+| stratified, 12 cells | **300 / 300** |
+| stratified, clean kernel | 0 false positives / 300 |
+
+Note the cell count is identical in both rows: **the strategy changed, not the
+budget**. Widen n and the uniform number goes to zero while the stratified one
+stays at 100%. This is the same move as poisoning the buffer pool — construct
+the dangerous case instead of waiting to land on it — applied to the sampler
+instead of the gate.
+
 ## The dirty-buffer gate (and the assumption it falsified)
 
 Buffer pooling introduced a bug class the gates were built before: a pooled
