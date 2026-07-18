@@ -364,14 +364,31 @@
       const fPipes = { gemm: mkPipe(WGSL_FGEMM), reduce: mkPipe(WGSL_FREDUCE) };
       let fgemm = (A, Bm, d) => gpuFgemm(device, fPipes, A, Bm, d);
       let fgemm2 = (A, B1, d1, B2, d2) => gpuFgemm2(device, fPipes, A, B1, d1, B2, d2);
+      let fgemmFma = false;                     // set by the gate below
       try {
         const m0 = 7, k0 = 4500, n0 = 5;                      // k big enough to exercise split-K
         const A = Float32Array.from({ length: m0 * k0 }, () => Math.random() - 0.5);
         const Bm = Float32Array.from({ length: k0 * n0 }, () => Math.random() - 0.5);
-        const hw = await fgemm(A, Bm, { m: m0, k: k0, n: n0 });
-        const ref = root.TrainCore.matmul(A, Bm, m0, k0, n0);
-        for (let i = 0; i < ref.length; i++)
-          if (Math.abs(hw[i] - ref[i]) > Math.abs(ref[i]) * 1e-3 + 1e-3) throw new Error("fgemm mismatch");
+        // EXACT gate, replacing an allclose. The mirror reproduces split-K's
+        // partition and accumulation order, so bit-equality is achievable and
+        // is the honest bar. WGSL may contract `s + a*b` into an FMA, so try
+        // both rounding schedules and record which the device implements —
+        // if NEITHER matches, the f32 backward is not bit-reproducible here
+        // and must not run, because its gradients set the weights the whole
+        // fleet is hashed against.
+        const dG = { m: m0, k: k0, n: n0 };
+        const hw = await fgemm(A, Bm, dG);
+        const mStep = root.Verified.fgemmMirror(A, Bm, dG, false);
+        const mFma = root.Verified.fgemmMirror(A, Bm, dG, true);
+        let okStep = true, okFma = true;
+        for (let i = 0; i < hw.length; i++) {
+          if (bitDiff(hw[i], mStep[i])) okStep = false;
+          if (bitDiff(hw[i], mFma[i])) okFma = false;
+          if (!okStep && !okFma) break;
+        }
+        if (!okStep && !okFma) throw new Error("fgemm matches neither rounding schedule — not bit-reproducible");
+        fgemmFma = !okStep;                     // remember what this device does
+        console.info(`split-K f32 GEMM is bit-exact (${okStep ? "two-rounding" : "fused"} multiply-add schedule)`);
         // The shared-operand pair must equal the two calls it replaces, EXACTLY:
         // same buffer, same shader, same arithmetic, so bit-level equality is
         // the honest bar (not a tolerance). Both index patterns of A are
