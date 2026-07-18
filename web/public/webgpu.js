@@ -363,6 +363,7 @@
       // split-K f32 GEMM for the STE backward (self-tested vs JS float matmul)
       const fPipes = { gemm: mkPipe(WGSL_FGEMM), reduce: mkPipe(WGSL_FREDUCE) };
       let fgemm = (A, Bm, d) => gpuFgemm(device, fPipes, A, Bm, d);
+      let fgemm2 = (A, B1, d1, B2, d2) => gpuFgemm2(device, fPipes, A, B1, d1, B2, d2);
       try {
         const m0 = 7, k0 = 4500, n0 = 5;                      // k big enough to exercise split-K
         const A = Float32Array.from({ length: m0 * k0 }, () => Math.random() - 0.5);
@@ -371,9 +372,22 @@
         const ref = root.TrainCore.matmul(A, Bm, m0, k0, n0);
         for (let i = 0; i < ref.length; i++)
           if (Math.abs(hw[i] - ref[i]) > Math.abs(ref[i]) * 1e-3 + 1e-3) throw new Error("fgemm mismatch");
+        // The shared-operand pair must equal the two calls it replaces, EXACTLY:
+        // same buffer, same shader, same arithmetic, so bit-level equality is
+        // the honest bar (not a tolerance). Both index patterns of A are
+        // exercised — transA on one leg, plain on the other, the live shapes.
+        const kT = 300, mT = 9, nT = 6;                       // A is mT x kT, used both ways
+        const A2 = Float32Array.from({ length: mT * kT }, () => Math.random() - 0.5);
+        const Bt = Float32Array.from({ length: mT * nT }, () => Math.random() - 0.5);
+        const Bn = Float32Array.from({ length: kT * nT }, () => Math.random() - 0.5);
+        const dT = { m: kT, k: mT, n: nT, transA: true }, dN = { m: mT, k: kT, n: nT };
+        const [f1, f2] = await fgemm2(A2, Bt, dT, Bn, dN);
+        const [r1, r2] = [await fgemm(A2, Bt, dT), await fgemm(A2, Bn, dN)];
+        for (let i = 0; i < r1.length; i++) if (bitDiff(f1[i], r1[i])) throw new Error("fgemm2 transA leg differs");
+        for (let i = 0; i < r2.length; i++) if (bitDiff(f2[i], r2[i])) throw new Error("fgemm2 plain leg differs");
       } catch (e) {
         console.warn("split-K f32 GEMM failed verification — backward stays in JS:", e.message);
-        fgemm = null;
+        fgemm = null; fgemm2 = null;
       }
 
       // Shared exact gate for a bgemm implementation. Sweeps shapes (including
@@ -404,18 +418,38 @@
         return null;
       }
 
+      // Poison the pool with large-magnitude residue at the gate's own shapes,
+      // so a re-gate runs on RECYCLED (non-zero) buffers. See the dirty-buffer
+      // gate note below the MLP gate for why this matters.
+      async function poisonBgemm(bgFn) {
+        for (const d0 of [{ m: 5, k: 9, n: 6, batch: 3, relu: true },
+                          { m: 32, k: 64, n: 32, batch: 1, relu: false },
+                          { m: 7, k: 253, n: 5, batch: 2, relu: true },
+                          { m: 1, k: 4, n: 1, batch: 1, relu: false },
+                          { m: 17, k: 33, n: 9, batch: 1, relu: true }]) {
+          const Xq = new Int8Array(d0.batch * d0.m * d0.k).fill(127);
+          const Wq = new Int8Array(d0.batch * d0.k * d0.n).fill(127);
+          const rs = new Float32Array(d0.batch * d0.m).fill(1e4);
+          const cs = new Float32Array(d0.batch * d0.n).fill(1e4);
+          await bgFn(Xq, Wq, rs, cs, d0);
+          await bgFn(Xq, Wq, rs, cs, { ...d0, acc: true });
+        }
+      }
+      const gateBgemmDirty = async (bgFn) => { await poisonBgemm(bgFn); return gateBgemm(bgFn); };
+
       const bgLut = (Xq, Wq, rs, cs, d) => gpuBgemmLUT(device, d.acc ? bgLutVPipe : bgLutPipe, lutBuf, Xq, Wq, rs, cs, d);
       // the LUT bgemm is the fallback AND the oracle's shader twin — gate it too
-      const lutBad = await gateBgemm(bgLut);
+      const lutBad = (await gateBgemm(bgLut)) || (await gateBgemmDirty(bgLut));
       if (lutBad) { console.warn("LUT bgemm shader failed verification — CPU mirrors only:", lutBad); return cpu; }
 
       // B2B MLP chain gate (CUTLASS ex. 13+23): run the WHOLE chain — gemm1 +
       // ReLU + on-GPU rowmax + on-GPU quantize + gemm2 — against the pure-JS
       // mirror chain, exact `!==` on both h1 and the final output. Sweeps
       // ragged shapes; h not a multiple of 4 exercises the pack-tail padding.
-      async function gateMlp(mlpFn) {
-        for (const d0 of [{ m: 6, k: 8, h: 12, n: 5 }, { m: 5, k: 16, h: 6, n: 3 },
-                          { m: 17, k: 33, h: 10, n: 9 }, { m: 32, k: 64, h: 128, n: 32 }]) {
+      const MLP_SHAPES = [{ m: 6, k: 8, h: 12, n: 5 }, { m: 5, k: 16, h: 6, n: 3 },
+                          { m: 17, k: 33, h: 10, n: 9 }, { m: 32, k: 64, h: 128, n: 32 }];
+      async function gateMlp(mlpFn, sweepOnly) {
+        for (const d0 of MLP_SHAPES) {
           const rnd = (len) => Float32Array.from({ length: len }, () => Math.random() * 2 - 1);
           const Xf = rnd(d0.m * d0.k), W1 = rnd(d0.k * d0.h), W2 = rnd(d0.h * d0.n);
           const hw = await root.Verified.vmlpBlock(Xf, W1, W2, d0, L, mlpFn, null);
@@ -426,6 +460,7 @@
           for (let i = 0; i < ref.out.length; i++)
             if (bitDiff(hw.out[i], ref.out[i])) return `out mismatch @${i} (${shape}): ${hw.out[i]} vs ${ref.out[i]}`;
         }
+        if (sweepOnly) return null;      // dirty re-gate: sweep is the point, skip the respec hunt
         // DISCRIMINATING case: the sweep above passes vacuously if no value
         // lands on a rounding boundary — the old round(x/scale) spec would
         // pass it too. So hunt (in fast JS) for an input where the two specs
@@ -467,14 +502,47 @@
       // test_b2b.js: 48M draws targeted at binade edges, 1.9M last-ulp
       // fused-vs-stepped differences, ZERO floor-visible. The `+0.5` respec is
       // contraction-immune by construction — `round(x/scale)` was not.
+      // ---- DIRTY-BUFFER GATE ----------------------------------------------
+      // A pooled buffer is NOT zero-initialized, so any kernel that assumes
+      // zeros (the rowmax atomicMax accumulator does) is right on step one and
+      // wrong on step two. That is a STATE bug: no single call is wrong, the
+      // sequence is — the family an oracle cannot reach.
+      //
+      // MEASURED, and it corrected the assumption that motivated this code:
+      // the existing sweep ALREADY catches it. Deleting the clearBuffer and
+      // re-running showed the plain gate failing at the SECOND shape, because
+      // the sweep's own shapes recycle each other's buffers (same power-of-2
+      // bucket) and an uncleared max only grows. So the suite was never
+      // blind — it had incidental dirty coverage nobody designed.
+      //
+      // Incidental is the problem. It relies on the sweep having >= 2 shapes,
+      // on them colliding in one bucket, and on the residue exceeding the real
+      // value. Change the shape list and the coverage silently evaporates.
+      // The poison below makes it deliberate: run first at 1e4 magnitude so
+      // the residue dominates ANY value the gate can produce, release it, then
+      // sweep again. Detection stops depending on ordering luck and covers the
+      // first shape too. Cheap by design — the re-gate skips the 800-trial
+      // respec hunt, which has nothing to do with buffer state.
+      async function poisonPool(mlpFn) {
+        // same shapes as the gate => same pool buckets => the gate's next
+        // acquisition is exactly one of these poisoned buffers (free list is LIFO)
+        const big = (len) => Float32Array.from({ length: len }, () => (Math.random() * 2 - 1) * 1e4);
+        for (const d0 of MLP_SHAPES)
+          await root.Verified.vmlpBlock(big(d0.m * d0.k), big(d0.k * d0.h), big(d0.h * d0.n), d0, L, mlpFn, null);
+      }
+      async function gateMlpDirty(mlpFn) {
+        await poisonPool(mlpFn);
+        return gateMlp(mlpFn, true);    // sweep only, on recycled non-zero buffers
+      }
+
       const lutMlpEnv = { dp4: false, gemm: bgLutPipe, rowmax: rowmaxPipe, quant: quantI32Pipe, lutBuf };
       let mlpLut = (xq, w1q, w2q, xs, w1s, w2s, d) => gpuMlpChain(device, lutMlpEnv, xq, w1q, w2q, xs, w1s, w2s, d);
-      const mlpLutBad = await gateMlp(mlpLut);
+      const mlpLutBad = (await gateMlp(mlpLut)) || (await gateMlpDirty(mlpLut));
       if (mlpLutBad) { console.warn("B2B MLP chain (LUT) failed verification — MLP stays on the CPU mirror chain:", mlpLutBad); mlpLut = null; }
 
       const viaLUT = { backend: "webgpu", label: `${gpuName} (LUT shader · exact-gated)`,
                        matmulInt8: (Xq, Wq, m, k, n) => gpuMatmulLUT(device, lutPipe, lutBuf, Xq, Wq, m, k, n),
-                       bgemm: bgLut, att, fgemm, mlp: mlpLut };
+                       bgemm: bgLut, att, fgemm, fgemm2, mlp: mlpLut };
 
       // DP4A pipeline — only if the WGSL feature exists AND its batched kernel
       // reproduces the verified units exactly across the shape sweep
@@ -482,14 +550,14 @@
         return viaLUT;
       const bgDp4Pipe = mkPipeL(WGSL_BG_DP4(false), bgDp4Layout), bgDp4VPipe = mkPipeL(WGSL_BG_DP4(true), bgDp4Layout);
       const bg = (Xq, Wq, rs, cs, d) => gpuBgemmDP4(device, d.acc ? bgDp4VPipe : bgDp4Pipe, Xq, Wq, rs, cs, d);
-      const dp4Bad = await gateBgemm(bg);
+      const dp4Bad = (await gateBgemm(bg)) || (await gateBgemmDirty(bg));
       if (dp4Bad) {
         console.warn("batched DP4A disagreed with the verified units — using LUT bgemm:", dp4Bad);
         return viaLUT;
       }
       const dp4MlpEnv = { dp4: true, gemm: bgDp4Pipe, rowmax: rowmaxPipe, quant: quantPackPipe };
       let mlpDp4 = (xq, w1q, w2q, xs, w1s, w2s, d) => gpuMlpChain(device, dp4MlpEnv, xq, w1q, w2q, xs, w1s, w2s, d);
-      const mlpDp4Bad = await gateMlp(mlpDp4);
+      const mlpDp4Bad = (await gateMlp(mlpDp4)) || (await gateMlpDirty(mlpDp4));
       if (mlpDp4Bad) { console.warn("B2B MLP chain (DP4A) failed verification — using the LUT chain:", mlpDp4Bad); mlpDp4 = mlpLut; }
 
       // Both backends are exact-gated bit-identical, so WHICH one runs is a
@@ -502,7 +570,7 @@
       // benchmark. First run of a fresh build is warm-up-skewed; the race
       // warms both before timing.
       const dp4 = { backend: "webgpu", label: `${gpuName} (DP4A int8 dot · exact-gated vs units)`,
-                    bgemm: bg, att, fgemm, mlp: mlpDp4 };
+                    bgemm: bg, att, fgemm, fgemm2, mlp: mlpDp4 };
       try {
         const d0 = { m: 256, k: 32, n: 32, batch: 3, relu: false };
         const rnd8 = (len) => { const a = new Int8Array(len); for (let i = 0; i < len; i++) a[i] = (Math.random() * 256 - 128) | 0; return a; };
@@ -616,6 +684,57 @@
     read.unmap();
     release(device, [bufA, bufB, bufP, bufD1, bufO, bufD2, read]);
     return out;
+  }
+
+  // SHARED-OPERAND fused f32 GEMM pair. The two embedding-gradient GEMMs both
+  // consume dlogits (BT x vocab). With the 16512-token vocab that operand is
+  // ~17 MB, and running them as two independent calls uploaded it TWICE and
+  // paid two submits and two map round trips — profiling put the pair at 55%
+  // of the whole step. Here A goes up ONCE, both GEMM+reduce chains ride one
+  // command encoder, one submit covers both, and the two readbacks are mapped
+  // concurrently. The shader reads A as either A[row*k+p] or A[p*m+row]
+  // (transA), so ONE flat buffer serves both index patterns — nothing about
+  // the arithmetic changes, which is why the gradients stay bit-identical.
+  async function gpuFgemm2(device, pipes, A, B1, d1, B2, d2) {
+    const SU = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
+    const UU = GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST;
+    const bufA = up(device, A, SU);                       // the shared 17 MB operand: ONE upload
+    const enc = device.createCommandEncoder();
+    const legs = [];
+    for (const [Bm, d] of [[B1, d1], [B2, d2]]) {
+      const { m, k, n } = d, transA = d.transA ? 1 : 0;
+      const S = k > 4096 ? Math.min(16, Math.ceil(k / 2048)) : 1;
+      const bufB = up(device, Bm, SU);
+      const bufP = mk(device, S * m * n * 4, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+      const bufD1 = up(device, new Uint32Array([m, k, n, transA | (S << 1)]), UU);
+      const bufO = mk(device, m * n * 4, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+      const bufD2 = up(device, new Uint32Array([m * n, S, 0, 0]), UU);
+      let pass = enc.beginComputePass();
+      pass.setPipeline(pipes.gemm);
+      pass.setBindGroup(0, device.createBindGroup({ layout: pipes.gemm.getBindGroupLayout(0), entries: [
+        { binding: 0, resource: { buffer: bufA } }, { binding: 1, resource: { buffer: bufB } },
+        { binding: 2, resource: { buffer: bufP } }, { binding: 3, resource: { buffer: bufD1 } } ] }));
+      pass.dispatchWorkgroups(Math.ceil(m / 8), Math.ceil(n / 8), S); pass.end();
+      pass = enc.beginComputePass();
+      pass.setPipeline(pipes.reduce);
+      pass.setBindGroup(0, device.createBindGroup({ layout: pipes.reduce.getBindGroupLayout(0), entries: [
+        { binding: 0, resource: { buffer: bufP } }, { binding: 1, resource: { buffer: bufO } },
+        { binding: 2, resource: { buffer: bufD2 } } ] }));
+      pass.dispatchWorkgroups(Math.ceil(m * n / 64)); pass.end();
+      const bytes = m * n * 4;
+      const read = mk(device, bytes, GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ);
+      enc.copyBufferToBuffer(bufO, 0, read, 0, bytes);
+      legs.push({ read, bytes, bufs: [bufB, bufP, bufD1, bufO, bufD2] });
+    }
+    device.queue.submit([enc.finish()]);                  // ONE submit for both GEMMs
+    await Promise.all(legs.map((l) => l.read.mapAsync(GPUMapMode.READ)));
+    const outs = legs.map((l) => {
+      const o = new Float32Array(l.read.getMappedRange(0, l.bytes).slice(0));
+      l.read.unmap();
+      return o;
+    });
+    release(device, [bufA, ...legs.flatMap((l) => [...l.bufs, l.read])]);
+    return outs;
   }
 
   // fused batched dispatch: f32 out, epilogue done on-device (raw=true reads the
