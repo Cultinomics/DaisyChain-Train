@@ -182,6 +182,7 @@
       cfg: { ...cfg, layers, heads, hidden, vocab: vocabSize() },
       ctx: { L, bgemm: (engine && engine.bgemm) || null,
              att: (engine && engine.att) || null, fgemm: (engine && engine.fgemm) || null,
+             fgemm2: (engine && engine.fgemm2) || null,
              mlp: (engine && engine.mlp) || null,
              audit: audit || null, unitBackward: !!cfg.unitBackward },
       emb: add("emb", mk(vocabSize() * c, 0.08)),
@@ -271,6 +272,11 @@
       const qq = V.quantizeRows(q, BT * heads, hd), kq = V.quantizeRows(k, BT * heads, hd);
       const sAll = ctx.att ? await ctx.att.scores(qq.q, kq.q, qq.s, kq.s, dAtt)
                            : V.attScoresJS(qq.q, kq.q, qq.s, kq.s, dAtt, ctx.L);
+      // live-shape audit: the init gate only ever saw four test shapes
+      if (ctx.att && ctx.audit && ctx.audit.due()) {
+        const bad = V.auditAttScores(qq.q, kq.q, qq.s, kq.s, dAtt, sAll, ctx.L, ctx.audit.cells);
+        if (bad) ctx.audit.fail(bad);
+      }
       const aAll = new Float32Array(BH * T * T);                   // causal softmax
       for (let bz = 0; bz < BH; bz++) {
         const so = bz * T * T;
@@ -286,6 +292,10 @@
       const vq = V.quantizeHeadCols(v, B, T, heads, hd);
       const ctxOut = ctx.att ? await ctx.att.ctx(aq.q, vq.q, aq.s, vq.s, dAtt)
                              : V.attCtxJS(aq.q, vq.q, aq.s, vq.s, dAtt, ctx.L);
+      if (ctx.att && ctx.audit && ctx.audit.due()) {
+        const bad = V.auditAttCtx(aq.q, vq.q, aq.s, vq.s, dAtt, ctxOut, ctx.L, ctx.audit.cells);
+        if (bad) ctx.audit.fail(bad);
+      }
       cb.aAll = aAll;                                  // backward slices heads from q/k/v/aAll
       cb.ctxOut = ctxOut;
       const attnOut = await vmm(ctxOut, bl.Wo, BT, C, C, ctx);
@@ -360,7 +370,16 @@
     // tied unembed: logits = lnf @ embᵀ, so the unembedding gradient flows
     // straight into emb — dlogitsᵀ @ lnf is V×C, emb's own shape
     let dlnfIn;
-    if (m.ctx.fgemm && !units) {
+    if (m.ctx.fgemm2 && !units) {
+      // Both GEMMs consume dlogits (BT x vocab, ~17 MB at the 16512 vocab).
+      // fgemm2 uploads it ONCE and runs both on one submit — profiling had
+      // this pair at 55% of the step, over half of it re-uploading the same
+      // operand. Bit-identical to the two separate calls (gated at init).
+      [g[gi.emb], dlnfIn] = await m.ctx.fgemm2(
+        cache.dlogits,
+        cache.lnf.y, { m: vocab, k: BT, n: C, transA: true },
+        m.emb, { m: BT, k: vocab, n: C });                    // split-K shape
+    } else if (m.ctx.fgemm && !units) {
       [g[gi.emb], dlnfIn] = await Promise.all([
         m.ctx.fgemm(cache.dlogits, cache.lnf.y, { m: vocab, k: BT, n: C, transA: true }),
         m.ctx.fgemm(cache.dlogits, m.emb, { m: BT, k: vocab, n: C }),      // split-K shape
