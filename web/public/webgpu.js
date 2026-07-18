@@ -560,34 +560,17 @@
       const mlpDp4Bad = (await gateMlp(mlpDp4)) || (await gateMlpDirty(mlpDp4));
       if (mlpDp4Bad) { console.warn("B2B MLP chain (DP4A) failed verification — using the LUT chain:", mlpDp4Bad); mlpDp4 = mlpLut; }
 
-      // Both backends are exact-gated bit-identical, so WHICH one runs is a
-      // free choice. On our NVIDIA part they TIE on the shipped float path
-      // (packing overhead cancels the dot-throughput win at these sizes) and
-      // DP4A is ~12% faster in int8-backward mode — but the ordering is
-      // device-dependent in principle (a driver with slow dot4I8Packed or a
-      // fast cache path for the LUT flips it). The race below costs ~40ms at
-      // init and self-calibrates per device instead of trusting one machine's
-      // benchmark. First run of a fresh build is warm-up-skewed; the race
-      // warms both before timing.
-      const dp4 = { backend: "webgpu", label: `${gpuName} (DP4A int8 dot · exact-gated vs units)`,
-                    bgemm: bg, att, fgemm, fgemm2, mlp: mlpDp4 };
-      try {
-        const d0 = { m: 256, k: 32, n: 32, batch: 3, relu: false };
-        const rnd8 = (len) => { const a = new Int8Array(len); for (let i = 0; i < len; i++) a[i] = (Math.random() * 256 - 128) | 0; return a; };
-        const Xq = rnd8(d0.batch * d0.m * d0.k), Wq = rnd8(d0.batch * d0.k * d0.n);
-        const rs = Float32Array.from({ length: d0.batch * d0.m }, () => Math.random() + 0.5);
-        const cs = Float32Array.from({ length: d0.batch * d0.n }, () => Math.random() + 0.5);
-        const time = async (fn) => {
-          await fn(Xq, Wq, rs, cs, d0); await fn(Xq, Wq, rs, cs, d0);      // warm
-          const t0 = performance.now();
-          for (let r = 0; r < 6; r++) await fn(Xq, Wq, rs, cs, d0);        // serialized, like training
-          return performance.now() - t0;
-        };
-        const tLut = await time(bgLut), tDp4 = await time(bg);
-        const winner = tDp4 <= tLut ? dp4 : viaLUT;
-        winner.label += ` · won init race ${Math.min(tLut, tDp4).toFixed(0)}ms vs ${Math.max(tLut, tDp4).toFixed(0)}ms`;
-        return winner;
-      } catch (e) { return dp4; }
+      // Both backends are exact-gated bit-identical, so which one runs is a
+      // free choice — and an init race that timed them was tried and REMOVED.
+      // Measured on this NVIDIA part they tie on the shipped float path (DP4A's
+      // JS packing cancels its dot-throughput win at these sizes), so the race
+      // bought nothing, cost ~40 ms of init, and made the backend vary between
+      // page loads — which silently invalidated three separate A/B benchmarks
+      // before it was noticed. A knob that changes what you are measuring is
+      // worse than a fixed choice. DP4A ships: it wins the int8-backward mode
+      // by ~12% and ties elsewhere.
+      return { backend: "webgpu", label: `${gpuName} (DP4A int8 dot · exact-gated vs units)`,
+               bgemm: bg, att, fgemm, fgemm2, mlp: mlpDp4 };
     } catch (e) { console.warn("WebGPU init failed, CPU fallback:", e); return cpu; }
   }
 
