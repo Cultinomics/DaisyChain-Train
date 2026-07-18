@@ -9,6 +9,7 @@
 const fs = require("fs");
 const path = require("path");
 const V = require("./public/verified_core.js");
+const TC = require("./public/traincore.js");
 
 const mul = new Int16Array(fs.readFileSync(path.join(__dirname, "public", "mul_lut.bin")).buffer.slice(0));
 const L = { mul };
@@ -179,6 +180,58 @@ console.log("\nthe audit must catch a LAST-COLUMN bug (uniform sampling cannot):
   let fp = 0;
   for (let t = 0; t < TRIALS; t++) if (V.auditTile(Xq, Wq, rs, cs, d, good, L, 12) !== null) fp++;
   ok(fp === 0, `no false positives on the clean kernel (${TRIALS} audits)`);
+}
+
+// ---- the attention kernels now get a LIVE audit too --------------------------
+// They had exact init gates but nothing at live shapes — the same gap the GEMM
+// audit exists to close. These must reject a corrupted attention output and
+// accept a clean one, at a shape the init gate never sees.
+console.log("\nthe attention audits must reject corrupted output:");
+{
+  const d = { B: 2, T: 24, heads: 3, hd: 8 };          // not one of the gate's shapes
+  const C = d.heads * d.hd, BH = d.B * d.heads;
+  const qq = rnd(d.B * d.T * C, () => (Math.random() * 256 - 128) | 0);
+  const kq = rnd(d.B * d.T * C, () => (Math.random() * 256 - 128) | 0);
+  const qs = Float32Array.from({ length: d.B * d.T * d.heads }, () => Math.random() + 0.5);
+  const ks = Float32Array.from({ length: d.B * d.T * d.heads }, () => Math.random() + 0.5);
+  const good = V.attScoresJS(qq, kq, qs, ks, d, L);
+  ok(V.auditAttScores(qq, kq, qs, ks, d, good, L, 12) === null, "att.scores audit accepts the clean kernel");
+  // corrupt the LAST head's last token pair — the classic head-stride bug
+  const badS = Float32Array.from(good);
+  badS[((d.B * d.heads - 1) * d.T + (d.T - 1)) * d.T + (d.T - 1)] = 0;
+  ok(V.auditAttScores(qq, kq, qs, ks, d, badS, L, 12) !== null, "att.scores audit rejects a corrupted last head/token");
+
+  const aq = rnd(BH * d.T * d.T, () => (Math.random() * 127) | 0);
+  const vq = rnd(d.B * d.T * C, () => (Math.random() * 256 - 128) | 0);
+  const as = Float32Array.from({ length: BH * d.T }, () => Math.random() + 0.5);
+  const vs = Float32Array.from({ length: BH * d.hd }, () => Math.random() + 0.5);
+  const goodC = V.attCtxJS(aq, vq, as, vs, d, L);
+  ok(V.auditAttCtx(aq, vq, as, vs, d, goodC, L, 12) === null, "att.ctx audit accepts the clean kernel");
+  const badC = Float32Array.from(goodC);               // last channel of the last head
+  badC[((d.B - 1) * d.T + (d.T - 1)) * C + (d.heads - 1) * d.hd + (d.hd - 1)] = 0;
+  ok(V.auditAttCtx(aq, vq, as, vs, d, badC, L, 12) !== null, "att.ctx audit rejects a corrupted last channel (scatter write-back)");
+}
+
+// ---- the f32 backward GEMM is no longer gated by a tolerance -----------------
+// fgemmMirror reproduces split-K's partition and accumulation order, so the
+// gate can compare with `!==`. This checks the mirror is self-consistent and
+// that the two rounding schedules it offers are genuinely different (i.e. the
+// gate is choosing between real alternatives, not two names for one thing).
+console.log("\nthe split-K mirror is exact and discriminating:");
+{
+  const m0 = 6, k0 = 5000, n0 = 4;                     // k > 4096 exercises split-K
+  const A = Float32Array.from({ length: m0 * k0 }, () => Math.random() - 0.5);
+  const Bm = Float32Array.from({ length: k0 * n0 }, () => Math.random() - 0.5);
+  const dG = { m: m0, k: k0, n: n0 };
+  const stepped = V.fgemmMirror(A, Bm, dG, false), fused = V.fgemmMirror(A, Bm, dG, true);
+  ok(V.fgemmMirror(A, Bm, dG, false).every((v, i) => !V.bitDiff(v, stepped[i])), "mirror is deterministic");
+  let diff = 0;
+  for (let i = 0; i < stepped.length; i++) if (V.bitDiff(stepped[i], fused[i])) diff++;
+  ok(diff > 0, `the two rounding schedules really differ (${diff}/${stepped.length} cells) — the gate picks between real alternatives`);
+  const naive = TC.matmul(A, Bm, m0, k0, n0);
+  let vsNaive = 0;
+  for (let i = 0; i < naive.length; i++) if (V.bitDiff(naive[i], stepped[i])) vsNaive++;
+  console.log(`  note   split-K order differs from a naive matmul on ${vsNaive}/${naive.length} cells — which is why the old gate had to use a tolerance, and why the mirror had to be written`);
 }
 
 console.log(pass ? "\nGATE TEST PASSED — the gate rejects real bugs and accepts the real kernel."
