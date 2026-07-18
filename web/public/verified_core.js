@@ -226,11 +226,23 @@
   // mirror and compare against what the kernel produced. Sampling cells instead
   // of whole matrices makes this cheap enough to run continuously, at the real
   // shapes training uses — not once at boot on toy inputs.
+  // STRATIFIED sampling. Uniformly random cells are the wrong instrument for
+  // the bugs that actually occur here: a bounds-guard off-by-one or a pack-tail
+  // padding bug lives on the LAST row/column, and uniform sampling finds that
+  // with probability ~1/n per cell — at the 16512-wide logits GEMM, never. So
+  // the first cells are the structurally dangerous ones (corners, last row,
+  // last column, last batch) chosen deterministically, and the remainder are
+  // random interior cells that catch diffuse bugs. Same principle as poisoning
+  // the buffer pool: construct the dangerous case, don't wait to land on it.
   function auditTile(Xq, Wq, rs, cs, d, got, L, nCells) {
     const { m, k, n } = d, batch = d.batch || 1, relu = !!d.relu, mul = L.mul;
-    for (let t = 0; t < (nCells || 8); t++) {
-      const bz = (Math.random() * batch) | 0;
-      const i = (Math.random() * m) | 0, j = (Math.random() * n) | 0;
+    const N = nCells || 8;
+    const edges = [[0, m - 1, n - 1], [0, 0, n - 1], [0, m - 1, 0], [0, 0, 0],
+                   [batch - 1, m - 1, n - 1], [batch - 1, 0, 0]];
+    for (let t = 0; t < N; t++) {
+      let bz, i, j;
+      if (t < edges.length) { bz = edges[t][0]; i = edges[t][1]; j = edges[t][2]; }
+      else { bz = (Math.random() * batch) | 0; i = (Math.random() * m) | 0; j = (Math.random() * n) | 0; }
       let acc = 0;
       const xrow = bz * m * k + i * k, wo = bz * k * n;
       for (let p = 0; p < k; p++) acc += mul[(Xq[xrow + p] & 0xFF) * 256 + (Wq[wo + p * n + j] & 0xFF)];
