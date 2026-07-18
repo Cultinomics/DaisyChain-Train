@@ -255,6 +255,92 @@
     return null;
   }
 
+  // ---- exact mirror of the split-K f32 GEMM ----------------------------------
+  // The f32 backward GEMM was the last kernel gated by a TOLERANCE (allclose at
+  // 1e-3) — and this project's own gate mutation test shows allclose waving
+  // through real bugs. The reason was real though: split-K accumulates in a
+  // different ORDER than a naive reference, so bit-equality against the naive
+  // one is impossible. The fix is the same as the epilogue mirror: reproduce
+  // the kernel's order exactly, then compare with `!==`.
+  //   partials: for z in 0..S-1, sum p in [z*ks, min(k,(z+1)*ks)) in order
+  //   reduce:   sum the S partials in ascending z
+  // `fma` selects the rounding schedule for `s + a*b`: WGSL PERMITS a compiler
+  // to contract that into a fused multiply-add (one rounding) instead of two.
+  // Which one the device does is a fact about the device, so the gate tries
+  // both and reports which matches rather than assuming.
+  function fgemmMirror(A, Bm, d, fma) {
+    const { m, k, n } = d, transA = !!d.transA;
+    const S = k > 4096 ? Math.min(16, Math.ceil(k / 2048)) : 1;
+    const ks = Math.ceil(k / S);
+    const out = new Float32Array(m * n);
+    for (let row = 0; row < m; row++)
+      for (let col = 0; col < n; col++) {
+        let acc = 0;                                    // reduce pass, ascending z
+        for (let z = 0; z < S; z++) {
+          const p0 = z * ks, p1 = Math.min(k, p0 + ks);
+          let s = 0;                                    // one partial, in order
+          for (let p = p0; p < p1; p++) {
+            const a = transA ? A[p * m + row] : A[row * k + p];
+            s = fma ? f32(s + a * Bm[p * n + col])      // single rounding
+                    : f32(s + f32(a * Bm[p * n + col]));
+          }
+          acc = f32(acc + s);
+        }
+        out[row * n + col] = acc;
+      }
+    return out;
+  }
+
+  // ---- live audits for the fused attention kernels ---------------------------
+  // The attention kernels had exact INIT gates but nothing at live shapes —
+  // the exact gap the GEMM audit exists to close, left open on the kernels with
+  // the trickiest indexing (head-strided gather, scatter write-back). These
+  // recompute individual output cells from the units, stratified like
+  // auditTile: last/first token pair, last head, last channel first, then
+  // random. Cost is hd (or T) multiply-adds per cell.
+  function auditAttScores(qq, kq, qs, ks, d, got, L, nCells) {
+    const { B, T, heads, hd } = d, C = heads * hd, mul = L.mul, raw = !!d.acc;
+    const N = nCells || 8;
+    const edges = [[B - 1, heads - 1, T - 1, T - 1], [0, 0, 0, 0],
+                   [0, heads - 1, T - 1, 0], [B - 1, 0, 0, T - 1]];
+    for (let t = 0; t < N; t++) {
+      let bi, h, ti, tj;
+      if (t < edges.length) { bi = edges[t][0]; h = edges[t][1]; ti = edges[t][2]; tj = edges[t][3]; }
+      else { bi = (Math.random() * B) | 0; h = (Math.random() * heads) | 0;
+             ti = (Math.random() * T) | 0; tj = (Math.random() * T) | 0; }
+      const bz = bi * heads + h;
+      const qo = (bi * T + ti) * C + h * hd, ko = (bi * T + tj) * C + h * hd;
+      let acc = 0;
+      for (let p = 0; p < hd; p++) acc += mul[(qq[qo + p] & 0xFF) * 256 + (kq[ko + p] & 0xFF)];
+      const v = raw ? acc : epi(acc, qs[(bi * T + ti) * heads + h], ks[(bi * T + tj) * heads + h]);
+      const idx = (bz * T + ti) * T + tj;
+      if (raw ? got[idx] !== v : bitDiff(got[idx], v))
+        return `att.scores audit failed at [b${bi},h${h},${ti},${tj}] B${B}T${T}H${heads}d${hd}: kernel ${got[idx]} vs units ${v}`;
+    }
+    return null;
+  }
+  function auditAttCtx(aq, vq, as, vs, d, got, L, nCells) {
+    const { B, T, heads, hd } = d, C = heads * hd, mul = L.mul, raw = !!d.acc;
+    const N = nCells || 8;
+    const edges = [[B - 1, heads - 1, T - 1, hd - 1], [0, 0, 0, 0],
+                   [0, heads - 1, T - 1, 0], [B - 1, 0, 0, hd - 1]];
+    for (let t = 0; t < N; t++) {
+      let bi, h, ti, j;
+      if (t < edges.length) { bi = edges[t][0]; h = edges[t][1]; ti = edges[t][2]; j = edges[t][3]; }
+      else { bi = (Math.random() * B) | 0; h = (Math.random() * heads) | 0;
+             ti = (Math.random() * T) | 0; j = (Math.random() * hd) | 0; }
+      const bz = bi * heads + h, ao = (bz * T + ti) * T;
+      let acc = 0;
+      for (let tj = 0; tj < T; tj++)
+        acc += mul[(aq[ao + tj] & 0xFF) * 256 + (vq[(bi * T + tj) * C + h * hd + j] & 0xFF)];
+      const v = raw ? acc : epi(acc, as[bz * T + ti], vs[(bi * heads + h) * hd + j]);
+      const idx = (bi * T + ti) * C + h * hd + j;
+      if (raw ? got[idx] !== v : bitDiff(got[idx], v))
+        return `att.ctx audit failed at [b${bi},h${h},${ti},${j}] B${B}T${T}H${heads}d${hd}: kernel ${got[idx]} vs units ${v}`;
+    }
+    return null;
+  }
+
   // block-scaled verified GEMM, float in → float out.
   //   d = { m, k, n, batch=1, relu=false }; X is (batch·m)×k, W is batch×(k×n)
   // gpuBgemm (from webgpu.js) runs the batched kernel with the fused epilogue;
@@ -403,7 +489,8 @@
 
   const api = { quantize, quantize2, quantizeRows, quantizeCols, quantizeHeadCols, lutMatmulJS, lutMatmul3JS, lutMatmul3,
                 bgemmJS, vgemmBlock, auditTile, epi, attScoresJS, attCtxJS, linearFwd, forward, backward, splitApply,
-                rowAbsMax, scalesFromAbsMax, quantizeRowsInv, vmlpBlock, bitDiff };
+                rowAbsMax, scalesFromAbsMax, quantizeRowsInv, vmlpBlock, bitDiff,
+                auditAttScores, auditAttCtx, fgemmMirror };
   if (typeof module !== "undefined" && module.exports) { TC = require("./traincore.js"); module.exports = api; }
   else { TC = root.TrainCore; root.Verified = api; }
 })(typeof self !== "undefined" ? self : this);
