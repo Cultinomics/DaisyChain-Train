@@ -212,9 +212,16 @@ things that run*, not argued ([full results](web/TEST_RESULTS.md)):
   differential gate's 4/4. Relations own the loop bugs; two definitional
   absolutes (ReLU output range, a unit-scale integer anchor) own the value
   bugs no relation can see.
-- **Exact kernel gates on every live kernel**, a continuous random-cell audit
-  at live shapes, and a cross-device kernel probe (same seeded int8 GEMM,
-  same hash on every honest device, any backend).
+- **Exact kernel gates on every live kernel**, a continuous audit at live
+  shapes, and a cross-device kernel probe (same seeded int8 GEMM, same hash on
+  every honest device, any backend). The audit's sampling was rebuilt against
+  a named bug class: its old constants (6 cells, 2% of GEMMs) bounded an
+  overhead that had never been measured (auditing *every* GEMM costs <0.01% of
+  a step), and uniform random cells cannot see a last-row/column bug at a
+  16512-wide output. Sampling is now **stratified** — the first cells are the
+  structural danger points, chosen deliberately. On a last-column bug, same
+  cell budget: uniform caught **5/300** audits, stratified **300/300**, with
+  zero false positives.
 - **RDNA2 ISA audit**: reading a real GPU's shader ISA against our
   determinism assumptions confirmed three of them on silicon (exact packed
   int8 dot; correctly-rounded f32 add/mul; 1-ULP reciprocal — division stays
