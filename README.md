@@ -363,12 +363,63 @@ docker/                      Dockerfile, dashboard image, compose (demo cluster)
 scripts/setup.bat / setup.sh interactive setup helpers
 config/                      nodes + cluster env examples
 examples/my_task_template.py starting point for your own model
+test_verified_units.py       full-domain checks of every shipped verified path (24)
 docs/                        QUICKSTART, LIMITS, CUSTOM_TASK, TAILSCALE
 daisychain/spikewhale_task.py   trains the real SpikeWhale on streamed HF datasets
 daisychain/spikewhale_panel.py  slider control panel (localhost:8899)
 web/                         DaisyChain-Web: P2P browser training (WebRTC + WebGPU)
 export_luts_web.py           regenerates web/public LUTs from the trained units
 ```
+
+## Recent updates (August 2026) — verified compute path
+
+Three changes to `daisychain/verified/`, each measured rather than asserted.
+`python test_verified_units.py` (24 checks) reproduces all of it.
+
+**Bounded GEMM memory.** `LUTBackend.gemm` and `NeuralBackend.gemm` materialized
+the whole `(m, n, k)` product block before reducing it, so peak memory was cubic
+in layer width. At the SpikeWhale panel's maximum (hidden 768, sequence 512) a
+single layer's forward allocated **2.4 GB** — on the spare hardware this project
+exists to use. Both now block the `m` axis. The contraction axis `k` is untouched,
+so the sum and its order are unchanged and results stay bit-identical:
+
+| GEMM | before | after |
+| --- | --- | --- |
+| 64x64x64 | 2.3 MB | 2.3 MB (unchanged path) |
+| 256x256x256 | 135.8 MB | 68.9 MB |
+| 512x768x768 (panel max) | 2426.9 MB | **77.2 MB** |
+| neural backend, 64x96x96 | 519.2 MB | **57.5 MB** |
+
+Caps are class attributes (`LUTBackend.max_block_bytes`,
+`NeuralBackend.max_products`), tunable per instance. Below the cap the LUT path
+takes the original single-block branch unchanged.
+
+The two backends need *different* accounting, which is worth knowing before tuning
+them: a LUT product costs 8 bytes, but a neural product is split into four nibble
+pairs through a 128-wide net and costs ~880 bytes. Applying the LUT's byte budget
+to the neural path computes a block 110x too large and never splits at all.
+
+**The multiply LUT is certified, not trusted.** `build_luts()` returned its tables
+unchecked while the docs described a self-certify gate. Because the table *is* the
+complete finite domain, certifying it **is** the exhaustive verification:
+`LUTBackend.__init__` now checks all 65536 entries against signed integer multiply
+and raises on mismatch. Cost: **0.5 ms**.
+
+**Full-domain tests for the paths that ship.** The units' exhaustive verification
+covers the scalar entry points (`NeuralMul8.verify()` walks `mul()`); production
+runs the batched ones — `mul_array`, `relu_array`, `requant_array` — and the LUTs
+built from them, which are different code. `test_verified_units.py` checks every
+shipped path against golden integer arithmetic over its complete domain. All pass
+today; nothing would have caught a regression before.
+
+**Two guards against silent no-ops.** `gemm_int8` enforces the int32 accumulator
+bound (`MAX_INT32_K = 131071`) instead of asserting it in a comment, since layer
+width is user-selectable and an overflow would produce wrong numbers rather than
+raise. `instrument.require(**minimums)` fails when a verified unit was
+under-invoked, and refuses to report at all while counting is disabled — a zero
+from a probe that was switched off is not evidence that the units did not run.
+
+---
 
 ## Install
 ```bash

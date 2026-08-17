@@ -42,16 +42,38 @@ class NeuralBackend:
     def available(self) -> bool:
         return hasattr(self.mul, "mul_array")
 
+    #: Cap on PRODUCTS (m*n*k entries) handed to one batched multiply.
+    #:
+    #: Counted in products, not bytes, because bytes-per-product here is not the
+    #: 8 of an int64 table lookup: `reshape(-1)` materializes the broadcast pair
+    #: arrays, `mul_array` then splits each product into FOUR nibble pairs, and
+    #: each pair goes through a 128-wide net whose activations dominate everything
+    #: else. Measured on the numpy side alone: ~880 bytes per product (589,824
+    #: products -> 519 MB peak), and torch's own allocations sit on top of that.
+    #:
+    #: Applying LUTBackend's m*n*k*8 accounting here -- which the first version of
+    #: this patch did -- computes a block 110x too large and never splits at all.
+    #: The contraction axis k is untouched either way, so blocking cannot change
+    #: the sum or its order: the result stays bit-identical.
+    max_products = 1 << 16
+
     def gemm(self, A: np.ndarray, B: np.ndarray) -> np.ndarray:
         A = np.asarray(A).astype(np.int64)
         B = np.asarray(B).astype(np.int64)
         m, k = A.shape
         _, n = B.shape
-        # all (A[i,t], B[t,j]) pairs -> one batched neural multiply -> sum over k
-        Ai = np.broadcast_to(A[:, None, :], (m, n, k))          # (m,n,k)
-        Bj = np.broadcast_to(B.T[None, :, :], (m, n, k))        # (m,n,k)
-        prod = self.mul.mul_array(Ai.reshape(-1), Bj.reshape(-1)).reshape(m, n, k)
-        return prod.sum(axis=2).astype(np.int64)
+        Bt = B.T[None, :, :]
+        out = np.empty((m, n), dtype=np.int64)
+        rows = max(1, int(self.max_products // max(1, n * k)))
+        for i in range(0, m, rows):
+            r = A[i:i + rows]
+            rn = r.shape[0]
+            # all (A[i,t], B[t,j]) pairs in this block -> one batched neural multiply
+            Ai = np.broadcast_to(r[:, None, :], (rn, n, k))
+            Bj = np.broadcast_to(Bt, (rn, n, k))
+            prod = self.mul.mul_array(Ai.reshape(-1), Bj.reshape(-1)).reshape(rn, n, k)
+            out[i:i + rows] = prod.sum(axis=2)
+        return out.astype(np.int64)
 
 
 def pick_backend(neural=None):
