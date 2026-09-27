@@ -6,6 +6,7 @@ entire finite input domain* (N/N verification).
 """
 from __future__ import annotations
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -27,6 +28,21 @@ def int_of(bits: torch.Tensor) -> int:
 def pm(bits: torch.Tensor) -> torch.Tensor:
     """Map {0,1} bits to {-1,+1} for a friendlier input scale."""
     return bits * 2.0 - 1.0
+
+
+def bits_matrix(vals, n: int) -> torch.Tensor:
+    """LSB-first bit rows for a whole array of ints -> float32 (len(vals), n).
+
+    Vectorised counterpart of `bits_of`. The per-unit `dataset()` builders used a
+    Python loop with two `bits_of` calls and a `torch.stack` per entry; for
+    NeuralRequant16 that is 65,536 iterations building 131,072 tiny tensors, and
+    it dominates both `fit()` and `verify()` -- the two things you must run to
+    change a unit at all. numpy builds the same matrix in one pass.
+
+    Identical output to stacking `bits_of` row by row.
+    """
+    a = np.asarray(vals, dtype=np.int64).reshape(-1, 1)
+    return torch.from_numpy(((a >> np.arange(n)) & 1).astype(np.float32))
 
 
 def mlp(inp: int, out: int, h: int = 128, layers: int = 3) -> nn.Sequential:

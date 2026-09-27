@@ -1,6 +1,6 @@
 # Test results — updated 2026-07-17
 
-All suites run with `npm test` (chains all eleven). Every suite exits 0.
+All suites run with `npm test` (chains all twelve). Every suite exits 0.
 Hardware for GPU numbers: NVIDIA via WebGPU, DP4A int8 dot path, exact-gated
 against the verified units at init.
 
@@ -16,6 +16,7 @@ against the verified units at init.
 | `test_optimizer.js` | DaisyAdam beats SGD through the units, deterministic replicas | PASS — 1.59 vs 1.95, replica diff 0.000e+0 |
 | `test_transformer.js` | the transformer LM trains through the units end to end | PASS — loss 4.75 → 1.26 (baseline 4.56), replica diff 0.000e+0 |
 | `test_unit_backward.js` | int8 STE gradients do not damage convergence | PASS — units/float loss ratio 1.007 |
+| `test_nonfinite.js` | every quantizer refuses NaN/Inf instead of zeroing the layer | PASS — 13/13; the old quantizers fail 12 (added 2026-09-27) |
 
 ## The IEEE-754 oracle (`test_ieee.js`)
 

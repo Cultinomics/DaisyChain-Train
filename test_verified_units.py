@@ -58,11 +58,16 @@ def main():
     ck("LUTBackend self-certified at construction",
        getattr(backend, "certified", None) == (65536, 65536))
 
-    print("requantize -- sat_int8(x >> 8), full int16 domain")
+    print("requantize -- sat_int8(round_half_up(x / 256)), full int16 domain")
     x = np.arange(65536)
     xs = np.where(x >= 32768, x - 65536, x)
-    rq_gold = np.clip(xs >> requant.shift, -128, 127)
-    ck("requant_array == sat_int8(x >> shift) over all 65536",
+    # Golden is ROUND-HALF-UP, not the arithmetic shift this used to assert.
+    # `x >> shift` is a floor, which carries a systematic -0.4981 LSB bias on every
+    # requantized activation (measured over this same domain); half-up measures
+    # +0.0020. The unit's reference was corrected and requant16.pt retrained
+    # against it, so this golden moved with it -- see NeuralRequant16._ref.
+    rq_gold = np.clip((xs + (1 << (requant.shift - 1))) >> requant.shift, -128, 127)
+    ck("requant_array == sat_int8(round_half_up(x/2**shift)) over all 65536",
        np.array_equal(requant.requant_array(x), rq_gold))
     ck("requant LUT == golden over all 65536",
        np.array_equal(luts["requant"][x & 0xFFFF], rq_gold))
@@ -154,6 +159,20 @@ def main():
     except AssertionError:
         ck("require() fails when a unit is under-invoked", True)
     instrument.disable()
+
+    print("quantize -- a non-finite input must fail loudly, not become int8 zeros")
+    import torch
+    from daisychain.verified.qat import VerifiedLinear
+    layer = VerifiedLinear(3, 2, mul, requant, relu_unit, fast=True)
+    ok_out = layer(torch.tensor([[0.5, -1.0, 3.0]]))
+    ck("a finite batch still runs", bool(torch.isfinite(ok_out).all()))
+    for bad in (float("nan"), float("inf")):
+        try:
+            layer(torch.tensor([[0.5, bad, 3.0]]))
+            ck("%r in the activations raises" % bad, False,
+               "quantized silently (the old path returned all-zero int8)")
+        except FloatingPointError:
+            ck("%r in the activations raises" % bad, True)
 
     print()
     if FAILURES:

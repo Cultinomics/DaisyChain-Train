@@ -29,6 +29,16 @@ class _VerifiedQGEMM(torch.autograd.Function):
         ctx.save_for_backward(x, w)
         ctx.device = x.device                       # verified units run on CPU;
         xnp, wnp = x.detach().cpu().numpy(), w.detach().cpu().numpy()
+        # A float -> int8 cast of NaN/Inf is undefined; numpy returns 0 with only a
+        # RuntimeWarning. One non-finite value anywhere made the whole-tensor scale NaN/Inf
+        # and silently zeroed EVERY quantized input of the layer (measured: [0.5, nan, 3.0]
+        # -> [0, 0, 0]). Refuse at the source so a diverging run fails where it diverged.
+        for nm, a in (("activations", xnp), ("weights", wnp)):
+            if not np.isfinite(a).all():
+                raise FloatingPointError(
+                    "non-finite %s entering the verified GEMM (%d of %d values); the int8 "
+                    "quantize would silently turn them all into 0"
+                    % (nm, int((~np.isfinite(a)).sum()), a.size))
         sx = max(float(np.abs(xnp).max()) / 127.0, 1e-8)
         sw = max(float(np.abs(wnp).max()) / 127.0, 1e-8)
         xq = np.clip(np.round(xnp / sx), -128, 127).astype(np.int8)

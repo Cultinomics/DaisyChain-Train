@@ -392,6 +392,7 @@
       // the write pattern changes. The GEMM itself still goes through ctx.bgemm
       // (exact-gated), and the live-shape audit still samples it.
       const quantizeColsAsRows = (X, rows, cols) => {   // == quantizeRows(tr(X), cols, rows)
+        V.assertFinite(X, "quantizeColsAsRows");
         const q = new Int8Array(cols * rows), s = new Float32Array(cols);
         for (let c = 0; c < cols; c++) {
           let mx = 0;

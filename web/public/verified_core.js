@@ -8,7 +8,26 @@
 
   let TC;   // TrainCore (matmul/transpose) — resolved per environment at the end
 
+  // A float -> int8 conversion has no answer for NaN/Inf, and the quantizers below give a
+  // silent wrong one: an Inf makes the |max| scale Infinity and EVERY value quantizes to 0
+  // ([0.5, Inf, 3] -> [0, 0, 0]); a NaN is skipped by `a > mx` and then stored as 0 by the
+  // Int8Array. The Python trainer refuses the same input (qat.py); so does this. One pass,
+  // no effect on finite inputs, so builds with and without it still co-train.
+  function assertFinite(X, where) {
+    for (let i = 0; i < X.length; i++) {
+      if (!Number.isFinite(X[i])) {
+        let bad = 0;
+        for (let j = i; j < X.length; j++) if (!Number.isFinite(X[j])) bad++;
+        const e = new Error("non-finite input to " + where + " (" + bad + " of " + X.length +
+                            " values): the int8 quantize would turn it into 0");
+        e.name = "NonFiniteError";
+        throw e;
+      }
+    }
+  }
+
   function quantize(X) {
+    assertFinite(X, "quantize");
     let mx = 0; for (let i = 0; i < X.length; i++) { const a = Math.abs(X[i]); if (a > mx) mx = a; }
     const scale = Math.max(mx / 127, 1e-8);
     const q = new Int8Array(X.length);
@@ -73,6 +92,7 @@
   // outlier no longer crushes the quantization resolution of every other
   // row/column. One LUT pass at this granularity beats the per-tensor 3-pass.
   function quantizeRows(X, rows, cols) {
+    assertFinite(X, "quantizeRows");
     const q = new Int8Array(rows * cols), s = new Float32Array(rows);
     for (let r = 0; r < rows; r++) {
       let mx = 0;
@@ -86,6 +106,7 @@
     return { q, s };
   }
   function quantizeCols(W, rows, cols) {
+    assertFinite(W, "quantizeCols");
     const q = new Int8Array(rows * cols), s = new Float32Array(cols);
     for (let c = 0; c < cols; c++) {
       let mx = 0;
@@ -120,6 +141,7 @@
   // (≤1 step) vs quantizeRows, so old and new builds cannot co-train — the
   // divergence guard stops such mixed groups by design.
   function rowAbsMax(X, rows, cols) {
+    assertFinite(X, "rowAbsMax");
     const mx = new Float32Array(rows);
     for (let r = 0; r < rows; r++) {
       let m = 0;
@@ -379,6 +401,7 @@
   // The (BT·heads)×hd row view of q/k IS the contiguous buffer, so
   // quantizeRows(q, BT·heads, hd) gives per-(token,head) scales for free.
   function quantizeHeadCols(v, B, T, heads, hd) {   // per (batch,head,channel) column
+    assertFinite(v, "quantizeHeadCols");
     const C = heads * hd;
     const q = new Int8Array(B * T * C), s = new Float32Array(B * heads * hd);
     for (let bi = 0; bi < B; bi++)
@@ -487,7 +510,7 @@
     for (let j = 0; j < W2.length; j++) W2[j] -= lr * gAvg[W1.length + j];
   }
 
-  const api = { quantize, quantize2, quantizeRows, quantizeCols, quantizeHeadCols, lutMatmulJS, lutMatmul3JS, lutMatmul3,
+  const api = { assertFinite, quantize, quantize2, quantizeRows, quantizeCols, quantizeHeadCols, lutMatmulJS, lutMatmul3JS, lutMatmul3,
                 bgemmJS, vgemmBlock, auditTile, epi, attScoresJS, attCtxJS, linearFwd, forward, backward, splitApply,
                 rowAbsMax, scalesFromAbsMax, quantizeRowsInv, vmlpBlock, bitDiff,
                 auditAttScores, auditAttCtx, fgemmMirror };

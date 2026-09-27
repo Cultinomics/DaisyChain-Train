@@ -24,7 +24,10 @@ import sys
 
 import torch
 
-_DEF_PATH = os.environ.get("DAISY_SW_PATH", r"C:\Users\quaz\Desktop\Spikewhale")
+#: Where model_v2.py / config.py / tokenizer.json live. The default used to be an
+#: absolute path on the author's own desktop, which in a published repo means every
+#: other user gets an ImportError naming a directory that was never theirs.
+_DEF_PATH = os.environ.get("DAISY_SW_PATH", os.path.join(os.getcwd(), "Spikewhale"))
 
 
 def _import_spikewhale():
@@ -111,7 +114,6 @@ class SpikeWhaleTask:
         rank = _envi("RANK", 0); world = _envi("WORLD_SIZE", 1)
         self.stream = _FineWebStream(self.tok, self.seqlen, rank, world)
         self._SpikeWhaleLM = SpikeWhaleLM
-        n = None
         print(f"[spikewhale] data source: {self.stream.source}", flush=True)
 
     def build_model(self):

@@ -2,6 +2,7 @@
 a readiness banner, P2P connectivity scan, pooled resource + capacity plan, and
 live training status. Config via DAISY_NODES_FILE. Serves on :8080."""
 import json
+from html import escape as _html_escape
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -27,6 +28,18 @@ def _chip(ok, yes="OK", no="DOWN"):
     return f'<span class="px-2 py-0.5 rounded text-xs font-semibold {cls}">{yes if ok else no}</span>'
 
 
+#: Remote-supplied strings are escaped before they reach the page.
+#:
+#: `device` and the GPU `name` come from each node's /resources JSON -- i.e. from
+#: the OTHER machine, not from local config -- and were interpolated raw into the
+#: dashboard HTML. A node serving `{"gpu": {"name": "<script>...</script>"}}`
+#: would run script in the operator's browser on the next 3-second refresh.
+#: The node list itself is local config and trusted, but escaping it too costs
+#: nothing and keeps the rule simple: nothing reaches the page unescaped.
+def _e(v) -> str:
+    return _html_escape("" if v is None else str(v))
+
+
 def render(d):
     ready = d["ready"]
     banner = ("bg-emerald-500", "✓ CLUSTER READY — all nodes connected") if ready \
@@ -37,20 +50,20 @@ def render(d):
         res = n.get("resources") or {}
         dev = res.get("device", "—")
         gpu = (res.get("gpu") or {}).get("name", "")
-        devlabel = f"{dev}" + (f" ({gpu})" if gpu else "")
+        devlabel = _e(dev) + (f" ({_e(gpu)})" if gpu else "")
         rows += f"""<tr class="border-b border-slate-100 dark:border-slate-800">
-          <td class="py-2 px-3 font-medium">{n['name']}</td>
-          <td class="py-2 px-3 text-slate-500">{n['host']}</td>
+          <td class="py-2 px-3 font-medium">{_e(n['name'])}</td>
+          <td class="py-2 px-3 text-slate-500">{_e(n['host'])}</td>
           <td class="py-2 px-3">{_chip(n['reachable'],'reachable','unreachable')}</td>
           <td class="py-2 px-3">{devlabel}</td>
           <td class="py-2 px-3 tabular-nums">{lat}</td></tr>"""
     plan = d["plan"]
     pr = ""
     for p in plan["per_node"]:
-        dv = p["device"] + (f" ({p['gpu']})" if p.get("gpu") else "")
+        dv = _e(p["device"]) + (f" ({_e(p['gpu'])})" if p.get("gpu") else "")
         ram = f'{p["ram_gb"]} GB' if p.get("ram_gb") is not None else "—"
         pr += f"""<tr class="border-b border-slate-100 dark:border-slate-800">
-          <td class="py-2 px-3 font-medium">{p['name']}</td>
+          <td class="py-2 px-3 font-medium">{_e(p['name'])}</td>
           <td class="py-2 px-3">{dv}</td>
           <td class="py-2 px-3 tabular-nums">{ram}</td>
           <td class="py-2 px-3 tabular-nums">{p['capacity']}</td>

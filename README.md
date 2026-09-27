@@ -126,9 +126,10 @@ it is **not** a substitute for a real GPU on large models. Full envelope in
   differential gate.
 - **RDNA2 ISA audit hardenings** — bit-level (−0-aware) gate comparisons;
   proof that FMA contraction cannot change the quantize.
-- **Eleven-suite test chain** (`cd web && npm test`) — convergence, replicas,
+- **Twelve-suite test chain** (`cd web && npm test`) — convergence, replicas,
   oracle, gates, properties, external corpus, **self-corpus** (the instruments
-  scored against my own bugs), B2B, optimizer, transformer LM, int8 backward;
+  scored against my own bugs), B2B, optimizer, transformer LM, int8 backward,
+  non-finite quantize refusal;
   results in [web/TEST_RESULTS.md](web/TEST_RESULTS.md).
 - **Dirty-buffer gate** — the pool is poisoned before a re-sweep so state bugs
   (a kernel assuming zeroed memory) are caught deterministically rather than
@@ -302,7 +303,7 @@ the gate; a stalled roster gradient is a bug in the *protocol*, where every
 computed value on every peer was correct, so no data oracle could fire. Those
 needed different instruments, not better oracles.
 
-All eleven test suites (`cd web && npm test`) pass; results with methodology in
+All twelve test suites (`cd web && npm test`) pass; results with methodology in
 [`web/TEST_RESULTS.md`](web/TEST_RESULTS.md).
 
 ---
@@ -363,13 +364,66 @@ docker/                      Dockerfile, dashboard image, compose (demo cluster)
 scripts/setup.bat / setup.sh interactive setup helpers
 config/                      nodes + cluster env examples
 examples/my_task_template.py starting point for your own model
-test_verified_units.py       full-domain checks of every shipped verified path (24)
+test_verified_units.py       full-domain checks of every shipped verified path (25)
 docs/                        QUICKSTART, LIMITS, CUSTOM_TASK, TAILSCALE
 daisychain/spikewhale_task.py   trains the real SpikeWhale on streamed HF datasets
 daisychain/spikewhale_panel.py  slider control panel (localhost:8899)
 web/                         DaisyChain-Web: P2P browser training (WebRTC + WebGPU)
 export_luts_web.py           regenerates web/public LUTs from the trained units
 ```
+
+## Recent updates (September 2026) — requant rounding, bounded units, non-finite guards
+
+Everything below is measured, and `python test_verified_units.py` (25 checks) plus
+`cd web && npm test` (twelve suites) reproduce it.
+
+**The requant rounds instead of truncating.** `NeuralRequant16` was
+`sat_int8(x >> 8)`, and Python's `>>` on negatives is an arithmetic floor, so every
+requantized activation carried a systematic bias. Over the full int16 domain:
+
+| requant | mean error | disagrees with the other on |
+| --- | --- | --- |
+| floor `x >> 8` (old) | **-0.4981 LSB** | 32,640 / 65,536 |
+| round-half-up `(x + 128) >> 8` (now) | +0.0020 LSB | |
+
+The shipped `requant16.pt` implemented the floor exactly, so this was real behaviour,
+not a stale docstring. It was **retrained** against the new reference and saved only
+at 65,536/65,536 (a 99.9% unit would silently break the LUT equivalence the browser
+relies on), and `web/public/requant_lut.bin` was **re-exported** to match: the
+invariant is *neural forward == LUT == native integer op*, so a table that lags its
+unit is a fork. Tie rule, stated precisely: this is half-UP; Python/numpy/torch
+`round` is half-to-even. The two differ on exactly the 128 exact ties (0.2% of
+inputs) and both are unbiased to within 0.002 LSB. The Python fleet quantizes with
+`np.round` and the browser with `floor(x + 0.5)`; the two fleets never co-train, so
+that cannot fork a group.
+
+**Bounded elementwise units.** The GEMM backends already capped their temporaries;
+the units right after them did not. `relu_array` / `requant_array` received the
+whole activation matrix in the proof path at ~1.5–2 KB per element (262,144
+elements = **407 MB**), and the multiply-LUT build pushed 262,144 rows through the
+atom net at startup (**277 MB RSS on every node**). Both are now blocked:
+407 MB → **2 MB, flat with N**; 277 MB → **1 MB**. Elementwise blocking is exact
+(no accumulation order), verified bit-identical at N = 1 / 999 / 32768 / 32769 /
+100000. `dataset()` builders are vectorised (65,536 Python iterations → one numpy
+pass, 0.015 s), which is what makes retraining a unit practical at all.
+
+**A NaN or Inf no longer quantizes to zeros.** A float → int8 conversion has no
+answer for NaN/Inf, and both trainers gave a silent wrong one:
+
+| path | input | old result |
+| --- | --- | --- |
+| Python `qat.py` | `[0.5, nan, 3.0]` | scale = NaN → **`[0, 0, 0]`** (only a RuntimeWarning) |
+| Python `qat.py` | `[0.5, inf, 3.0]` | scale = Inf → **`[0, 0, 0]`** |
+| browser quantizers | `[0.5, Inf, 3]` | scale = Infinity → **`[0, 0, 0]`** |
+| browser quantizers | `[0.5, NaN, 3]` | NaN skipped by the \|max\| scan, stored as **0** |
+
+One bad value zeroed the whole layer's int8 input and training carried on. Now
+`VerifiedLinear` raises `FloatingPointError`, and every browser quantizer
+(`quantize`, `quantizeRows`, `quantizeCols`, `rowAbsMax`, `quantizeHeadCols`, and
+the transformer's `quantizeColsAsRows`) throws `NonFiniteError`, naming how many
+values were bad. Finite inputs are untouched, so builds with and without the guard
+still co-train. Both new tests fail against the old code (Python: 2 checks; web:
+`test_nonfinite.js`, 12) and pass now.
 
 ## Recent updates (August 2026) — verified compute path
 

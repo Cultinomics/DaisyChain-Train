@@ -58,14 +58,23 @@ class NeuralMul4:
         a = (np.asarray(a).astype(np.int64) & 0xF)
         b = (np.asarray(b).astype(np.int64) & 0xF)
         idx = np.arange(4)
-        bits_a = (a[:, None] >> idx) & 1
-        bits_b = (b[:, None] >> idx) & 1
-        x = np.concatenate([bits_a, bits_b], axis=1).astype(np.float32) * 2.0 - 1.0
-        out = (self.net(torch.from_numpy(x)) > 0).to(torch.int64).numpy()
         from . import instrument
-        instrument.bump("NeuralMul4.forward_calls", 1)
-        instrument.bump("NeuralMul4.products", a.shape[0])
-        return (out * (1 << np.arange(8))).sum(axis=1)
+        from .ops import _blocked
+
+        def _run(sl):
+            ca, cb = a[sl], b[sl]
+            bits_a = (ca[:, None] >> idx) & 1
+            bits_b = (cb[:, None] >> idx) & 1
+            x = np.concatenate([bits_a, bits_b], axis=1).astype(np.float32) * 2.0 - 1.0
+            out = (self.net(torch.from_numpy(x)) > 0).to(torch.int64).numpy()
+            instrument.bump("NeuralMul4.forward_calls", 1)
+            return (out * (1 << np.arange(8))).sum(axis=1)
+
+        # BOUNDED. `NeuralBackend.gemm` blocks before it reaches here, but the LUT build does not:
+        # `build_mul8_lut` hands NeuralMul8.mul_array all 65,536 pairs, which become 262,144 rows
+        # through this net. Measured 277 MB RSS at import time, on every node, on hardware this
+        # project targets for being small. Blocking is exact -- this is an elementwise map.
+        return _blocked(_run, np.arange(a.shape[0]))
 
 
 class NeuralMul8:

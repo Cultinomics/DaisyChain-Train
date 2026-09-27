@@ -176,9 +176,24 @@ class H(BaseHTTPRequestHandler):
         pass
 
 
+#: Bind address. LOOPBACK BY DEFAULT -- this is a control plane, not a status page.
+#:
+#: It bound 0.0.0.0 while printing "http://localhost:8899", so the operator was
+#: told it was local-only when in fact anyone who could reach the port could
+#: POST /start and spawn a training subprocess on this machine, unauthenticated.
+#: `cfg["dataset"]` from that body becomes DAISY_SW_DATASET and is handed to
+#: `datasets.load_dataset()`, so the caller also chooses what the box downloads.
+#:
+#: The agent and cluster dashboard legitimately listen on 0.0.0.0 -- they are
+#: read-only telemetry that other nodes scan. This one starts and stops work, so
+#: it defaults to loopback and exposure is opt-in via SW_PANEL_HOST.
+HOST = os.environ.get("SW_PANEL_HOST", "127.0.0.1")
+
+
 def main():
-    print(f"[spikewhale-panel] http://localhost:{PORT}", flush=True)
-    ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()
+    print(f"[spikewhale-panel] http://{'localhost' if HOST in ('127.0.0.1', 'localhost') else HOST}:{PORT}"
+          + ("" if HOST == "127.0.0.1" else f"  (listening on {HOST})"), flush=True)
+    ThreadingHTTPServer((HOST, PORT), H).serve_forever()
 
 
 if __name__ == "__main__":
