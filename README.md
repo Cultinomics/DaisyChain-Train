@@ -136,38 +136,6 @@ Zero-install browser training. Devices on the same network auto-group (Snapdrop-
 
 **Live demo:** https://huggingface.co/spaces/Quazim0t0/DaisyChain-Web
 
-### Recent updates (July 2026) - DaisyChain-Web
-
-**Verification stack.** The browser trainer's correctness is now checked by things that run, not argued. Full results: [web/TEST_RESULTS.md](web/TEST_RESULTS.md).
-
-- **IEEE-754 oracle** (`web/test_ieee.js`). A binary32 oracle built from the standard in exact BigInt arithmetic proves the JS epilogue mirror is spec-correct, and rejects the old round-once mirror on 34% of inputs.
-- **Metamorphic properties + oracle mutation scoring** (`test_metamorphic.js`, `test_corpus.js`). Properties needing no reference implementation, scored against an externally-authored bug taxonomy. **4/4**, matching the exact differential gate's 4/4. Relations own the loop bugs. Two definitional absolutes (ReLU output range, a unit-scale integer anchor) own the value bugs no relation can see.
-- **Exact kernel gates on every live kernel**, a continuous audit at live shapes, and a cross-device kernel probe (same seeded int8 GEMM, same hash on every honest device, any backend). The audit's sampling was rebuilt against a named bug class. Its old constants (6 cells, 2% of GEMMs) bounded an overhead that had never been measured (auditing *every* GEMM costs <0.01% of a step), and uniform random cells cannot see a last-row/column bug at a 16512-wide output. Sampling is now **stratified**: the first cells are the structural danger points, chosen deliberately. On a last-column bug, same cell budget: uniform caught **5/300** audits, stratified **300/300**, with zero false positives.
-- **RDNA2 ISA audit.** Reading a real GPU's shader ISA against our determinism assumptions confirmed three of them on silicon (exact packed int8 dot; correctly-rounded f32 add/mul; 1-ULP reciprocal - division stays off the GPU) and produced two hardenings. (1) Real ISAs have non-IEEE variants that **flush -0 to +0**. JS `!==` cannot see that (`-0 !== 0` is false), so all gates and audits now compare **bit patterns** - exactly what the replica hash sees. (2) FMA contraction of the quantize's `x·inv + 0.5` (one rounding instead of two) turned out to be **floor-invisible by construction** - proven in `test_b2b.js` with 175k+ last-ulp anomalies at binade edges, zero surviving `floor()`. Rounding mode and denorm flushing are runtime driver state on real hardware, which is why every device re-runs the exact gates at every init.
-
-**Training data.** FineWeb-Edu (10BT sample) is the hardcoded dataset. The Space reads random slices of the parquet shards straight off the HF CDN with range requests (pure-JS `hyparquet`, SNAPPY) and serves plain text at `/data`. No dependency on the datasets-server rows API and its 503s.
-
-**Resilience.** The sync guard now *repairs* instead of halting. A roster gradient that reached the leader but not some follower (asymmetric WebRTC mesh) is re-requested from the leader, bit-exact, and the run continues. The guard still stops anything that would fork the weights.
-
-**CUTLASS-style kernel work**, each step proven bit-identical or exact-gated:
-
-- **Dispatch-optimized backward** (ex. 05/24): independent GEMMs overlapped, sibling trios fused into batch-3 dispatches. Bit-identical gradients. Dormant int8-backward path down from 1.63x to 1.21x vs float.
-- **QKV dual-GEMM fusion** (ex. 45): q/k/v share one left operand. Quantized once, one batched dispatch, zero changed bits.
-- **B2B MLP chain** (ex. 13 + 23): both MLP GEMMs back-to-back on the GPU with a fused per-row absmax reduction. The intermediate is quantized on-device via a WGSL-exact respec (`floor(f32(x·invScale)+0.5)` - no GPU division) whose fround-stepped JS mirror keeps mixed GPU/CPU fleets bit-identical.
-
-**Profile-driven speed work.** Every change below is bit-identical (gradient and loss hashes unchanged), so none of it trades correctness for wall clock:
-
-- **Buffer pooling.** GPU buffers are recycled by size bucket instead of being created and destroyed per dispatch (~19 per MLP call, per layer, per step). **6-10% faster**, every hash unchanged.
-- **Shared-operand embedding GEMMs.** Profiling put two f32 backward GEMMs at **55% of the entire step**, and both consumed the same `dlogits` operand: ~17 MB at the 16512-token vocab, uploaded *twice*. One upload, one encoder, one submit: that pair went 205 -> 90 ms and the step **12% faster**. The fusion is gated bit-for-bit against the two calls it replaces.
-- **A negative result, kept on purpose.** The remaining hot kernel looked cache-hostile (adjacent lanes wrote 66 KB apart), but making the writes contiguous changed nothing. Two probes explain why: holding the output at 17 MB while cutting compute 32x barely moved the time. The logits GEMM is **transfer-bound, not compute-bound**, and the readback cannot be removed because softmax must stay in JS (WGSL's `exp` is not correctly rounded, and a per-vendor `exp` would fork replicas). The real lever there is the vocabulary, not the kernel.
-- **An init backend race was tried and removed.** It tied on the shipped path, cost ~430 ms of init, and made the backend vary between page loads, which silently invalidated three A/B comparisons before it was caught. A knob that changes what you are measuring is worse than a fixed choice.
-
-**Dirty-buffer gate - and the assumption it falsified.** Pooling introduced a bug class the gates predate: a pooled buffer is *not* zero-initialized, so a kernel that assumes zeros is right on step one and wrong on step two. That is a **state** bug, where no single call is wrong and the *sequence* is, which is the family no oracle can reach. The assumption was that the gates were blind to it. Mutation-testing the gate proved otherwise: deleting the zeroing made the plain gate fail at its *second* shape, because the sweep's own shapes recycle each other's buffers. The suite had **incidental** coverage nobody designed, which is coverage nobody can rely on. Shorten the shape list and it evaporates with the gate still green. It is now deliberate: the pool is poisoned with 1e4-magnitude residue before a re-sweep, so detection no longer depends on ordering luck. ~90 ms one-time.
-
-**Scoring the oracles against my OWN bugs** (`web/test_selfcorpus.js`). The external corpus measures kernel bugs someone else wrote down, so this suite asks the harder question: what do the instruments score against the four real bugs of the month? Properties **0/2** on the data-plane pair (the `c·out` theorem again), differential **2/2** - but half the bugs were not in the kernels at all. A dead gate is a bug in a *checker*, caught only by mutating the gate. A stalled roster gradient is a bug in the *protocol*, where every computed value on every peer was correct, so no data oracle could fire. Those needed different instruments, not better oracles.
-
-All thirteen test suites (`cd web && npm test`) pass. Results with methodology in [`web/TEST_RESULTS.md`](web/TEST_RESULTS.md).
-
 ---
 
 ## How it works
@@ -286,6 +254,38 @@ The two backends need *different* accounting, which is worth knowing before tuni
 **Full-domain tests for the paths that ship.** The units' exhaustive verification covers the scalar entry points (`NeuralMul8.verify()` walks `mul()`). Production runs the batched ones: `mul_array`, `relu_array`, `requant_array`, and the LUTs built from them, which are different code. `test_verified_units.py` checks every shipped path against golden integer arithmetic over its complete domain. All pass today. Nothing would have caught a regression before.
 
 **Two guards against silent no-ops.** `gemm_int8` enforces the int32 accumulator bound (`MAX_INT32_K = 131071`) instead of asserting it in a comment, since layer width is user-selectable and an overflow would produce wrong numbers rather than raise. `instrument.require(**minimums)` fails when a verified unit was under-invoked, and refuses to report at all while counting is disabled. A zero from a probe that was switched off is not evidence that the units did not run.
+
+## Recent updates (July 2026) - DaisyChain-Web
+
+**Verification stack.** The browser trainer's correctness is now checked by things that run, not argued. Full results: [web/TEST_RESULTS.md](web/TEST_RESULTS.md).
+
+- **IEEE-754 oracle** (`web/test_ieee.js`). A binary32 oracle built from the standard in exact BigInt arithmetic proves the JS epilogue mirror is spec-correct, and rejects the old round-once mirror on 34% of inputs.
+- **Metamorphic properties + oracle mutation scoring** (`test_metamorphic.js`, `test_corpus.js`). Properties needing no reference implementation, scored against an externally-authored bug taxonomy. **4/4**, matching the exact differential gate's 4/4. Relations own the loop bugs. Two definitional absolutes (ReLU output range, a unit-scale integer anchor) own the value bugs no relation can see.
+- **Exact kernel gates on every live kernel**, a continuous audit at live shapes, and a cross-device kernel probe (same seeded int8 GEMM, same hash on every honest device, any backend). The audit's sampling was rebuilt against a named bug class. Its old constants (6 cells, 2% of GEMMs) bounded an overhead that had never been measured (auditing *every* GEMM costs <0.01% of a step), and uniform random cells cannot see a last-row/column bug at a 16512-wide output. Sampling is now **stratified**: the first cells are the structural danger points, chosen deliberately. On a last-column bug, same cell budget: uniform caught **5/300** audits, stratified **300/300**, with zero false positives.
+- **RDNA2 ISA audit.** Reading a real GPU's shader ISA against our determinism assumptions confirmed three of them on silicon (exact packed int8 dot; correctly-rounded f32 add/mul; 1-ULP reciprocal - division stays off the GPU) and produced two hardenings. (1) Real ISAs have non-IEEE variants that **flush -0 to +0**. JS `!==` cannot see that (`-0 !== 0` is false), so all gates and audits now compare **bit patterns** - exactly what the replica hash sees. (2) FMA contraction of the quantize's `x·inv + 0.5` (one rounding instead of two) turned out to be **floor-invisible by construction** - proven in `test_b2b.js` with 175k+ last-ulp anomalies at binade edges, zero surviving `floor()`. Rounding mode and denorm flushing are runtime driver state on real hardware, which is why every device re-runs the exact gates at every init.
+
+**Training data.** FineWeb-Edu (10BT sample) is the hardcoded dataset. The Space reads random slices of the parquet shards straight off the HF CDN with range requests (pure-JS `hyparquet`, SNAPPY) and serves plain text at `/data`. No dependency on the datasets-server rows API and its 503s.
+
+**Resilience.** The sync guard now *repairs* instead of halting. A roster gradient that reached the leader but not some follower (asymmetric WebRTC mesh) is re-requested from the leader, bit-exact, and the run continues. The guard still stops anything that would fork the weights.
+
+**CUTLASS-style kernel work**, each step proven bit-identical or exact-gated:
+
+- **Dispatch-optimized backward** (ex. 05/24): independent GEMMs overlapped, sibling trios fused into batch-3 dispatches. Bit-identical gradients. Dormant int8-backward path down from 1.63x to 1.21x vs float.
+- **QKV dual-GEMM fusion** (ex. 45): q/k/v share one left operand. Quantized once, one batched dispatch, zero changed bits.
+- **B2B MLP chain** (ex. 13 + 23): both MLP GEMMs back-to-back on the GPU with a fused per-row absmax reduction. The intermediate is quantized on-device via a WGSL-exact respec (`floor(f32(x·invScale)+0.5)` - no GPU division) whose fround-stepped JS mirror keeps mixed GPU/CPU fleets bit-identical.
+
+**Profile-driven speed work.** Every change below is bit-identical (gradient and loss hashes unchanged), so none of it trades correctness for wall clock:
+
+- **Buffer pooling.** GPU buffers are recycled by size bucket instead of being created and destroyed per dispatch (~19 per MLP call, per layer, per step). **6-10% faster**, every hash unchanged.
+- **Shared-operand embedding GEMMs.** Profiling put two f32 backward GEMMs at **55% of the entire step**, and both consumed the same `dlogits` operand: ~17 MB at the 16512-token vocab, uploaded *twice*. One upload, one encoder, one submit: that pair went 205 -> 90 ms and the step **12% faster**. The fusion is gated bit-for-bit against the two calls it replaces.
+- **A negative result, kept on purpose.** The remaining hot kernel looked cache-hostile (adjacent lanes wrote 66 KB apart), but making the writes contiguous changed nothing. Two probes explain why: holding the output at 17 MB while cutting compute 32x barely moved the time. The logits GEMM is **transfer-bound, not compute-bound**, and the readback cannot be removed because softmax must stay in JS (WGSL's `exp` is not correctly rounded, and a per-vendor `exp` would fork replicas). The real lever there is the vocabulary, not the kernel.
+- **An init backend race was tried and removed.** It tied on the shipped path, cost ~430 ms of init, and made the backend vary between page loads, which silently invalidated three A/B comparisons before it was caught. A knob that changes what you are measuring is worse than a fixed choice.
+
+**Dirty-buffer gate - and the assumption it falsified.** Pooling introduced a bug class the gates predate: a pooled buffer is *not* zero-initialized, so a kernel that assumes zeros is right on step one and wrong on step two. That is a **state** bug, where no single call is wrong and the *sequence* is, which is the family no oracle can reach. The assumption was that the gates were blind to it. Mutation-testing the gate proved otherwise: deleting the zeroing made the plain gate fail at its *second* shape, because the sweep's own shapes recycle each other's buffers. The suite had **incidental** coverage nobody designed, which is coverage nobody can rely on. Shorten the shape list and it evaporates with the gate still green. It is now deliberate: the pool is poisoned with 1e4-magnitude residue before a re-sweep, so detection no longer depends on ordering luck. ~90 ms one-time.
+
+**Scoring the oracles against my OWN bugs** (`web/test_selfcorpus.js`). The external corpus measures kernel bugs someone else wrote down, so this suite asks the harder question: what do the instruments score against the four real bugs of the month? Properties **0/2** on the data-plane pair (the `c·out` theorem again), differential **2/2** - but half the bugs were not in the kernels at all. A dead gate is a bug in a *checker*, caught only by mutating the gate. A stalled roster gradient is a bug in the *protocol*, where every computed value on every peer was correct, so no data oracle could fire. Those needed different instruments, not better oracles.
+
+All thirteen test suites (`cd web && npm test`) pass. Results with methodology in [`web/TEST_RESULTS.md`](web/TEST_RESULTS.md).
 
 ---
 
