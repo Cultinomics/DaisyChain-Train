@@ -914,7 +914,15 @@ async function train(cfg, resume) {
       else if (hs && hs.has(id)) { lossSum += hs.get(id).loss; lossN++; contrib.set(id, (contrib.get(id) || 0) + 1); }
     }
     const clusterLoss = lossSum / Math.max(1, lossN);
-    const avg = TrainCore.averageGrads(all);
+    let avg;
+    try { avg = TrainCore.averageGrads(all); }
+    catch (e) {
+      // every device averages the same roster, so every device stops HERE, at the same step,
+      // with weights and Adam state untouched (still a valid checkpoint to resume from)
+      if (e.name !== "GradientError") throw e;
+      halted = `step ${s + 1}: ${e.message} -- refusing to apply it (weights and Adam state unchanged)`;
+      break;
+    }
     const upd = opt.step(avg);                      // DaisyAdam on the cluster-avg grad
     Transformer.applyUpdate(model, upd);            // W -= upd (lr folded into upd)
     // retain a few applied steps so stalled peers can repair (evict beyond that)

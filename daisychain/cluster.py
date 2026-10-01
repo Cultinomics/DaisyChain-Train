@@ -31,14 +31,21 @@ def configure_cpu(fraction: float = 0.9) -> int:
     return n
 
 
+def _cuda_usable() -> bool:
+    """is_available() alone is not enough: with CUDA_VISIBLE_DEVICES set but EMPTY (a common way
+    to say "CPU only") torch reports available=True and device_count()=0, and the node crashed
+    at startup in get_device_properties(0). Require a device to actually exist (2026-09-30)."""
+    return torch.cuda.is_available() and torch.cuda.device_count() > 0
+
+
 def pick_device() -> "torch.device":
     if os.environ.get("DAISY_FORCE_CPU") == "1":
         return torch.device("cpu")
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device("cuda" if _cuda_usable() else "cpu")
 
 
 def _gpu_info():
-    if not torch.cuda.is_available():
+    if not _cuda_usable():
         return None
     p = torch.cuda.get_device_properties(0)
     return {"name": p.name, "vram_gb": round(p.total_memory / 1e9, 1),
@@ -131,6 +138,35 @@ def broadcast_params(model, src: int = 0):
 
 
 @torch.no_grad()
+def check_finite_grads(model, step: int) -> None:
+    """Refuse a non-finite REDUCED gradient before the optimizer applies it.
+
+    After the all-reduce every rank holds the identical summed gradient, so every rank reaches
+    the same verdict with no extra communication and they all stop at the same step. Before
+    2026-09-30 one node's NaN was summed into every replica and opt.step() wrote it into the
+    weights (and Adam's moments) everywhere -- the replicas still agreed, so replica_diff
+    could not see it."""
+    for name, p in model.named_parameters():
+        if p.grad is not None and not bool(torch.isfinite(p.grad).all()):
+            bad = int((~torch.isfinite(p.grad)).sum())
+            raise FloatingPointError(
+                "step %d: reduced gradient of %s has %d non-finite value(s); refusing to apply "
+                "it (weights and optimizer state unchanged)" % (step, name, bad))
+
+
+@torch.no_grad()
+def cluster_mean_loss(loss, weight: float) -> float:
+    """The full-batch mean loss: sum_i w_i * loss_i with the SAME capacity weights
+    (w_i = n_i / sum n) the gradient all-reduce uses. A collective -- call it on every rank.
+
+    It used to be sum(loss_i) / world: an equal-weight mean of UNEQUAL batches, so the logged
+    cluster loss leaned toward the small (slow) nodes whenever capacities differed (2026-09-30)."""
+    lt = loss.detach().to("cpu").clone().double() * weight
+    dist.all_reduce(lt, op=dist.ReduceOp.SUM)
+    return lt.item()
+
+
+@torch.no_grad()
 def capacity_weighted_allreduce_grads(model, weight: float):
     """Σ_i w_i g_i with w_i = n_i/Σn_j == the true full-batch mean gradient.
     Reduced on CPU copies so mixed CPU/GPU nodes interoperate over gloo."""
@@ -185,14 +221,13 @@ class DaisyCluster:
             loss = task.loss(model, X, y)
             loss.backward()
             capacity_weighted_allreduce_grads(model, w)
+            check_finite_grads(model, s)
             opt.step()
             if step_delay:
                 time.sleep(step_delay)
             if s % max(1, steps // 20) == 0 or s == steps - 1:
-                lt = loss.detach().to("cpu").clone()
-                dist.all_reduce(lt, op=dist.ReduceOp.SUM)
+                cl = cluster_mean_loss(loss, w)             # collective: every rank calls it
                 if self.is_master():
-                    cl = lt.item() / self.world
                     print(f"  step {s:5d}  cluster-avg loss {cl:.6f}", flush=True)
                     if status_path:
                         self._write_status(status_path, step=s, total_steps=steps,

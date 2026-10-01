@@ -35,8 +35,22 @@
     return { q, scale };
   }
 
+  // int32 accumulator headroom: |a*b| <= 128*128, so K*16384 must fit in int32. Same bound as
+  // the Python kernel (kernel.MAX_INT32_K). The Int32Array accumulators here WRAP exactly like
+  // WGSL i32, so CPU and GPU peers would agree -- on a silently wrong sum. Refuse instead.
+  const MAX_INT32_K = Math.floor((2 ** 31 - 1) / (128 * 128));      // 131071
+  function accBound(k, where) {
+    if (k > MAX_INT32_K) {
+      const e = new Error(where + ": contraction length " + k + " exceeds the int32 accumulator " +
+                          "headroom " + MAX_INT32_K + " (the sum would wrap)");
+      e.name = "AccumulatorBoundError";
+      throw e;
+    }
+  }
+
   // int8 matmul via the verified multiply LUT: acc(m×n) = sum_k mulLUT[Xq,Wq]
   function lutMatmulJS(Xq, Wq, m, k, n, L) {
+    accBound(k, "lutMatmulJS");
     const C = new Int32Array(m * n), mul = L.mul;
     for (let i = 0; i < m; i++) {
       for (let p = 0; p < k; p++) {
@@ -151,6 +165,12 @@
     return mx;
   }
   function scalesFromAbsMax(mx) {                // f64 divisions: exactly rounded, device-identical
+    // The GPU chain gets mx from an atomicMax over bitcast(abs(h)) and never passes through
+    // rowAbsMax, so this is where ITS non-finite guard lives: NaN bits (0x7FC00000) and Inf
+    // (0x7F800000) both order above every finite |h| as u32, so the row max is non-finite iff
+    // some element is. Before 2026-09-30 a GPU peer turned that into inv = 0/NaN and quantized
+    // floor(NaN) on the device (implementation-defined) where a CPU peer threw.
+    assertFinite(mx, "scalesFromAbsMax");
     const scale = new Float32Array(mx.length), inv = new Float32Array(mx.length);
     for (let i = 0; i < mx.length; i++) {
       scale[i] = Math.max(mx[i] / 127, 1e-8);
@@ -221,6 +241,7 @@
   function bgemmJS(Xq, Wq, rs, cs, d, L) {
     const { m, k, n } = d, batch = d.batch || 1, relu = !!d.relu, mul = L.mul;
     const raw = !!d.acc;
+    accBound(k, "bgemmJS");
     const out = raw ? new Int32Array(batch * m * n) : new Float32Array(batch * m * n);
     const acc = new Int32Array(n);
     for (let bz = 0; bz < batch; bz++) {
@@ -510,7 +531,7 @@
     for (let j = 0; j < W2.length; j++) W2[j] -= lr * gAvg[W1.length + j];
   }
 
-  const api = { assertFinite, quantize, quantize2, quantizeRows, quantizeCols, quantizeHeadCols, lutMatmulJS, lutMatmul3JS, lutMatmul3,
+  const api = { assertFinite, accBound, MAX_INT32_K, quantize, quantize2, quantizeRows, quantizeCols, quantizeHeadCols, lutMatmulJS, lutMatmul3JS, lutMatmul3,
                 bgemmJS, vgemmBlock, auditTile, epi, attScoresJS, attCtxJS, linearFwd, forward, backward, splitApply,
                 rowAbsMax, scalesFromAbsMax, quantizeRowsInv, vmlpBlock, bitDiff,
                 auditAttScores, auditAttCtx, fgemmMirror };

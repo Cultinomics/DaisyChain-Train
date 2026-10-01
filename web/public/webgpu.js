@@ -611,6 +611,7 @@
   }
 
   async function gpuMatmulLUT(device, pipeline, lutBuf, Xq, Wq, m, k, n) {
+    root.Verified.accBound(k, "gpuMatmulLUT");                  // WGSL `var s : i32` wraps past this
     const X32 = Int32Array.from(Xq), W32 = Int32Array.from(Wq);   // byte -> i32
     const bufX = up(device, X32, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
     const bufW = up(device, W32, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
@@ -626,6 +627,7 @@
   // attention kernels: int8 (widened i32) in, f32 out, strided head indexing
   async function gpuAttScores(device, pipeline, qq, kq, qs, ks, d) {
     const { B, T, heads } = d;
+    root.Verified.accBound(d.hd, "gpuAttScores");
     const bufQ = up(device, Int32Array.from(qq), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
     const bufK = up(device, Int32Array.from(kq), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
     const bufQs = up(device, qs, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
@@ -640,6 +642,7 @@
   }
   async function gpuAttCtx(device, pipeline, aq, vq, as, vs, d) {
     const { B, T, heads, hd } = d;
+    root.Verified.accBound(T, "gpuAttCtx");
     const bufA = up(device, Int32Array.from(aq), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
     const bufV = up(device, Int32Array.from(vq), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
     const bufAs = up(device, as, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
@@ -759,6 +762,7 @@
 
   async function gpuBgemmLUT(device, pipeline, lutBuf, Xq, Wq, rs, cs, d) {
     const { m, k, n } = d, batch = d.batch || 1, flags = d.relu ? 1 : 0;
+    root.Verified.accBound(k, "gpuBgemmLUT");
     const bufX = up(device, Int32Array.from(Xq), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
     const bufW = up(device, Int32Array.from(Wq), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
     const bufR = up(device, rs, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
@@ -775,6 +779,7 @@
 
   async function gpuBgemmDP4(device, pipeline, Xq, Wq, rs, cs, d) {
     const { m, k, n } = d, batch = d.batch || 1, flags = d.relu ? 1 : 0;
+    root.Verified.accBound(k, "gpuBgemmDP4");
     const kw = Math.ceil(k / 4);
     const Xp = packRows(Xq, batch * m, k, kw);            // rows are (batch·m)
     const Wp = new Uint32Array(batch * n * kw);           // per-batch Wᵀ, packed
@@ -801,6 +806,7 @@
   // left operand is produced and consumed entirely on the GPU.
   async function gpuMlpChain(device, env, xq, w1q, w2q, xs, w1s, w2s, d) {
     const { m, k, h, n } = d, dp4 = !!env.dp4;
+    root.Verified.accBound(k, "gpuMlpChain gemm1"); root.Verified.accBound(h, "gpuMlpChain gemm2");
     const SU = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
     let bufX, bufW1, bufW2, kw1, hw;
     if (dp4) {

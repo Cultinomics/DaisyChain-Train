@@ -303,7 +303,7 @@ the gate; a stalled roster gradient is a bug in the *protocol*, where every
 computed value on every peer was correct, so no data oracle could fire. Those
 needed different instruments, not better oracles.
 
-All twelve test suites (`cd web && npm test`) pass; results with methodology in
+All thirteen test suites (`cd web && npm test`) pass; results with methodology in
 [`web/TEST_RESULTS.md`](web/TEST_RESULTS.md).
 
 ---
@@ -371,6 +371,30 @@ daisychain/spikewhale_panel.py  slider control panel (localhost:8899)
 web/                         DaisyChain-Web: P2P browser training (WebRTC + WebGPU)
 export_luts_web.py           regenerates web/public LUTs from the trained units
 ```
+
+## Recent updates (30 September 2026) — reductions refuse what they used to accept
+
+Six fixes, each found by applying a lesson from differential-testing an RDNA2 shader
+translator: *a second implementation nobody checks is not verified*, *inactive or absent
+participants must not leak into a reduction*, *a max over NaN is undefined*, and *know your
+accumulator width*. Every one is covered by a check that fails on the old code.
+`python test_verified_units.py` + `python test_cluster_reductions.py` and
+`cd web && npm test` (thirteen suites) reproduce all of it.
+
+| # | where | what was wrong | now |
+| --- | --- | --- | --- |
+| 1 | browser, WebGPU MLP chain | the row max comes from an `atomicMax` over `bitcast(abs(h))` and never passed the non-finite guard the CPU path has; a NaN/Inf `h1` became `inv = 0`/NaN and the GPU quantized `floor(NaN)` (implementation-defined) where a CPU peer threw | `scalesFromAbsMax` refuses a non-finite max. NaN and Inf bits order above every finite value as u32, so the row max is non-finite **iff** some element is — one check covers the whole row (checked on 2000 random rows) |
+| 2 | browser, `averageGrads` | a gradient of a different length was silently averaged over a prefix (typed arrays ignore out-of-range writes); a NaN/Inf gradient went straight into DaisyAdam, poisoning `m`/`v` on **every** peer identically, so no fork check could see it | refuses both with `GradientError`; the training loop halts at that step with weights and Adam state untouched (still a valid checkpoint) |
+| 3 | browser, int8 GEMMs (JS and WGSL) | the `Int32Array` and WGSL `i32` accumulators wrap past K = 131,071 — CPU and GPU agree, on a wrong sum | refused with `AccumulatorBoundError` at every GEMM entry point; the same bound as the Python kernel's `MAX_INT32_K` |
+| 4 | Python, logged cluster loss | `sum(loss_i) / world` — an equal-weight mean of **unequal**, capacity-weighted batches | `cluster_mean_loss` = Σ wᵢ·lossᵢ with the gradient's own weights. Measured on 3- and 13-sample nodes: old **1.418**, true full-batch loss **0.959**, new 0.959 |
+| 5 | Python, gradient all-reduce | one node's NaN was summed into every replica and applied | `check_finite_grads` refuses the reduced gradient before `opt.step()`; every rank holds the same sum, so every rank stops at the same step with no extra communication |
+| 6 | Python, `pick_device` | with `CUDA_VISIBLE_DEVICES` set but **empty** (a common "CPU only"), torch reports `is_available() = True` and `device_count() = 0`, and the node crashed at startup | a device must actually exist; falls back to CPU |
+
+Unchanged for valid inputs: finite gradients, finite activations, and K ≤ 131,071 produce
+bit-identical results to before, so updated and older peers still co-train. A 2-rank
+end-to-end `DaisyCluster.fit` run stays bit-identical across replicas (`replica_diff 0.0`).
+The WebGPU-side changes are host-side JavaScript (checked by `node --check` and by the
+Node suites through the shared mirror functions); the WGSL kernels themselves are unchanged.
 
 ## Recent updates (September 2026) — requant rounding, bounded units, non-finite guards
 
