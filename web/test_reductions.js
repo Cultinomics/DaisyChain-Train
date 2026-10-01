@@ -77,6 +77,12 @@ ck("(context) Int32Array really wraps 2^31 to -2^31 -- the silent failure being 
 ck("bgemmJS refuses the same K",
    throwsName(() => V.bgemmJS(worst, worst, new Float32Array(1), new Float32Array(1),
                               { m: 1, k: K, n: 1 }, L), "AccumulatorBoundError"));
+ck("attScoresJS refuses head width hd > 131071 (the CPU mirror of gpuAttScores)",
+   throwsName(() => V.attScoresJS(worst, worst, new Float32Array(1), new Float32Array(1),
+                                  { B: 1, T: 1, heads: 1, hd: K }, L), "AccumulatorBoundError"));
+ck("attCtxJS refuses T > 131071 (it contracts over keys, like gpuAttCtx)",
+   throwsName(() => V.attCtxJS(new Int8Array(1), new Int8Array(1), new Float32Array(1), new Float32Array(1),
+                               { B: 1, T: K, heads: 1, hd: 1 }, L), "AccumulatorBoundError"));
 const okK = worst.subarray(0, V.MAX_INT32_K);
 ck("K = 131071 still runs and is exact (131071 * 16384)",
    V.lutMatmulJS(okK, okK, 1, V.MAX_INT32_K, 1, L)[0] === 131071 * 16384);

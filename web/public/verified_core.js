@@ -447,6 +447,9 @@
   // d.acc=true returns the raw int32 accumulator (exact oracle for the kernel gate)
   function attScoresJS(qq, kq, qs, ks, d, L) {
     const { B, T, heads, hd } = d, C = heads * hd, mul = L.mul, raw = !!d.acc;
+    // the WGSL kernel sums these in i32; this mirror sums in doubles. Bound both identically so
+    // a CPU peer and a GPU peer refuse the same shapes instead of one halting alone.
+    accBound(hd, "attScoresJS");
     const out = raw ? new Int32Array(B * heads * T * T) : new Float32Array(B * heads * T * T);
     for (let bi = 0; bi < B; bi++) for (let h = 0; h < heads; h++) {
       const bz = bi * heads + h;
@@ -465,6 +468,7 @@
   // ctx[(bi,ti),(h,j)] = Σ_tj a[bz,ti,tj]·v[(bi,tj),(h,j)] — scatter fused into BT×C
   function attCtxJS(aq, vq, as, vs, d, L) {
     const { B, T, heads, hd } = d, C = heads * hd, mul = L.mul, raw = !!d.acc;
+    accBound(T, "attCtxJS");                       // contracts over keys, like gpuAttCtx
     const out = raw ? new Int32Array(B * T * C) : new Float32Array(B * T * C);
     for (let bi = 0; bi < B; bi++) for (let h = 0; h < heads; h++) {
       const bz = bi * heads + h;

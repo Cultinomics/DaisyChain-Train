@@ -856,7 +856,12 @@
     const mx = new Float32Array(readM.getMappedRange(0, m * 4).slice(0)); readM.unmap();
     // scale derivation in JS f64 — exactly rounded, identical on every device
     // (WGSL division is 2.5 ULP, which is why it never runs on the GPU)
-    const sc = root.Verified.scalesFromAbsMax(mx);
+    let sc;
+    try { sc = root.Verified.scalesFromAbsMax(mx); }   // refuses a non-finite row max
+    catch (e) {                                        // hand the pooled buffers back first
+      release(device, [bufX, bufW1, bufW2, bufRs, bufCs1, bufCs2, bufH, bufMX, bufD1, bufDM, readH, readM]);
+      throw e;
+    }
     const bufInv = up(device, sc.inv, SU), bufHs = up(device, sc.scale, SU);
     const bufQ = mk(device, m * hw * 4, GPUBufferUsage.STORAGE);
     const bufDQ = up(device, new Uint32Array([m, h, hw, 0]), UU);

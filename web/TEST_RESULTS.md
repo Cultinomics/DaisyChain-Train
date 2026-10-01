@@ -18,7 +18,7 @@ against the verified units at init.
 | `test_unit_backward.js` | int8 STE gradients do not damage convergence | PASS — units/float loss ratio 1.007 |
 | `test_b2b.js` | the chained GPU MLP's CPU mirror: gemm1 byte-identical to the un-chained GEMM, deterministic, +0.5 quantize FMA-contraction-immune | PASS — chained transformer converges 4.7384 → 2.0512 |
 | `test_nonfinite.js` | every quantizer refuses NaN/Inf instead of zeroing the layer | PASS — 13/13; the old quantizers fail 12 (added 2026-09-27) |
-| `test_reductions.js` | the GPU row-max guard is complete, `averageGrads` refuses wrong-length / non-finite gradients, int32 accumulators refuse K > 131,071 | PASS — 17/17; the old code fails 11 (added 2026-09-30) |
+| `test_reductions.js` | the GPU row-max guard is complete, `averageGrads` refuses wrong-length / non-finite gradients, int32 accumulators refuse K > 131,071 | PASS — 19/19; the old code fails 13 (added 2026-09-30) |
 
 ## The IEEE-754 oracle (`test_ieee.js`)
 
