@@ -334,6 +334,40 @@
     return out;
   }
 
+  // ---- live audit for the split-K f32 GEMM -----------------------------------
+  // Every int8 kernel had a live-shape audit; the f32 backward GEMM -- whose
+  // output IS the embedding gradient -- had only its init gate at 7x4500x5 and
+  // 9x300x6, while training runs it at vocab x BT x C. Same remedy as auditTile:
+  // recompute a few cells (structural corners first) with the mirror's exact
+  // partition and rounding schedule, compare bit-for-bit (2026-10-14 review).
+  function fgemmCell(A, Bm, d, fma, row, col) {
+    const { m, k, n } = d, transA = !!d.transA;
+    const S = k > 4096 ? Math.min(16, Math.ceil(k / 2048)) : 1;
+    const ks = Math.ceil(k / S);
+    let acc = 0;
+    for (let z = 0; z < S; z++) {
+      const p0 = z * ks, p1 = Math.min(k, p0 + ks);
+      let s = 0;
+      for (let p = p0; p < p1; p++) {
+        const a = transA ? A[p * m + row] : A[row * k + p];
+        s = fma ? f32(s + a * Bm[p * n + col]) : f32(s + f32(a * Bm[p * n + col]));
+      }
+      acc = f32(acc + s);
+    }
+    return acc;
+  }
+  function auditFgemm(A, Bm, d, got, fma, nCells) {
+    const { m, n } = d, N = nCells || 8;
+    const edges = [[m - 1, n - 1], [0, n - 1], [m - 1, 0], [0, 0]];
+    for (let t = 0; t < N; t++) {
+      const [i, j] = t < edges.length ? edges[t] : [(Math.random() * m) | 0, (Math.random() * n) | 0];
+      const v = fgemmCell(A, Bm, d, fma, i, j);
+      if (bitDiff(got[i * n + j], v))
+        return `f32 GEMM audit failed at [${i},${j}] shape ${m}x${d.k}x${n}${d.transA ? " transA" : ""}: kernel ${got[i * n + j]} vs mirror ${v}`;
+    }
+    return null;
+  }
+
   // ---- live audits for the fused attention kernels ---------------------------
   // The attention kernels had exact INIT gates but nothing at live shapes —
   // the exact gap the GEMM audit exists to close, left open on the kernels with
@@ -538,7 +572,7 @@
   const api = { assertFinite, accBound, MAX_INT32_K, quantize, quantize2, quantizeRows, quantizeCols, quantizeHeadCols, lutMatmulJS, lutMatmul3JS, lutMatmul3,
                 bgemmJS, vgemmBlock, auditTile, epi, attScoresJS, attCtxJS, linearFwd, forward, backward, splitApply,
                 rowAbsMax, scalesFromAbsMax, quantizeRowsInv, vmlpBlock, bitDiff,
-                auditAttScores, auditAttCtx, fgemmMirror };
+                auditAttScores, auditAttCtx, fgemmMirror, auditFgemm };
   if (typeof module !== "undefined" && module.exports) { TC = require("./traincore.js"); module.exports = api; }
   else { TC = root.TrainCore; root.Verified = api; }
 })(typeof self !== "undefined" ? self : this);

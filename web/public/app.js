@@ -268,14 +268,21 @@ function setupChannel(peerId, dc) {
     // the next step boundary instead of making them wait for the next run
     if (training && leaderId === null) { pendingJoins.add(peerId); log(`${nmeOf(peerId)} will be synced into the running training`); }
   };
-  dc.onclose = () => { chans.delete(peerId); updatePeers(); wake(); scheduleReconnect(peerId); };
+  dc.onclose = () => { chans.delete(peerId); dropFragments(peerId); updatePeers(); wake(); scheduleReconnect(peerId); };
   dc.onmessage = (e) => onGrad(peerId, e.data);
 }
 function cleanupPeer(id) {
   const pc = pcs.get(id); if (pc) pc.close();
   pcs.delete(id); chans.delete(id); pendingCand.delete(id); pendingJoins.delete(id);
-  for (const k of fragIn.keys()) if (k.startsWith(id + ":")) fragIn.delete(k);
+  dropFragments(id);
   wake();
+}
+// A message cut off by a closed channel is never completed (the sender does not
+// resume it), so its parts must go when the channel does. Before 2026-10-14 only
+// cleanupPeer dropped them, and only the reconnect INITIATOR calls that: the
+// other side kept up to a resume bundle's worth of dead parts per drop.
+function dropFragments(id) {
+  for (const k of [...fragIn.keys()]) if (k.startsWith(id + ":")) fragIn.delete(k);
 }
 
 // ---- checkpoints ------------------------------------------------------------
@@ -555,8 +562,13 @@ function onFragment(peerId, buf) {               // returns full message when co
   const key = peerId + ":" + id;
   let st = fragIn.get(key);
   if (!st) { st = { id, parts: [], got: 0, total }; fragIn.set(key, st); }
+  if (seq < 0 || seq >= st.total || total !== st.total) {     // malformed: drop the whole message, loudly
+    log(`dropped malformed message ${id} from ${nmeOf(peerId)} (fragment ${seq}/${total}, expected /${st.total})`);
+    fragIn.delete(key);
+    return null;
+  }
+  if (!st.parts[seq]) st.got++;                  // a repeated part must not count twice
   st.parts[seq] = new Uint8Array(buf, 16).slice(0);
-  st.got++;
   if (st.got < st.total) return null;
   fragIn.delete(key);
   let len = 0; for (const p of st.parts) len += p.length;
@@ -612,8 +624,12 @@ async function refreshProbe() {
     mathHash = Compute.mathProbe();
     log(`JS math library hash: ${mathHash.toString(16)} (peers must match; ECMA-262 does not require exp/log/cos/sin to be correctly rounded)`);
   }
+  // A failed probe must not leave the PREVIOUS hash in place: that hash would
+  // go out with every gradient as a proof of kernels this run never re-checked.
+  // 0 means "unproven", and the roster check halts on it (2026-10-14; the same
+  // shape as an emulator call that reported success without doing the work).
   try { probeHash = await Compute.kernelProbe(compute, L); }
-  catch (e) { log(`kernel probe failed to run: ${e.message}`); }
+  catch (e) { probeHash = 0; log(`kernel probe failed to run: ${e.message} — this device's kernels are UNPROVEN`); }
   return probeHash;
 }
 function hashWeights() {                        // FNV-1a over the flat param bytes
@@ -898,8 +914,16 @@ async function train(cfg, resume) {
       if (bad) { halted = `weights diverged from ${nmeOf(bad)} (detected at step ${s + 1})`; break; }
       // kernel disagreement: same seeded probe, same exact integer arithmetic
       // expected on every backend. This is the check the weight hash can't make.
-      const badK = roster.find(id => id !== myId && hs.has(id) && hs.get(id).phash &&
-                                     probeHash && hs.get(id).phash !== probeHash);
+      // phash 0 = that device's probe did not run. It used to make this
+      // comparison skip the peer (`phash && ...`), so a device whose kernels
+      // could not be proven trained on unchecked; now it stops the run.
+      const unproven = roster.find(id => hs.has(id) && !hs.get(id).phash);
+      if (unproven) {
+        halted = `${unproven === myId ? "this device's" : nmeOf(unproven) + "'s"} kernel probe failed to run ` +
+                 `at step ${s + 1} — its arithmetic is unproven, so its gradients cannot be trusted`;
+        break;
+      }
+      const badK = roster.find(id => id !== myId && hs.has(id) && hs.get(id).phash !== probeHash);
       if (badK) {
         halted = `kernel disagreement with ${nmeOf(badK)} at step ${s + 1} — their verified-unit probe ` +
                  `hashes ${hs.get(badK).phash} vs mine ${probeHash}. One of us is computing different ` +

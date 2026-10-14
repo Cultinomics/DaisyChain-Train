@@ -182,7 +182,7 @@
       cfg: { ...cfg, layers, heads, hidden, vocab: vocabSize() },
       ctx: { L, bgemm: (engine && engine.bgemm) || null,
              att: (engine && engine.att) || null, fgemm: (engine && engine.fgemm) || null,
-             fgemm2: (engine && engine.fgemm2) || null,
+             fgemm2: (engine && engine.fgemm2) || null, fgemmFma: !!(engine && engine.fgemmFma),
              mlp: (engine && engine.mlp) || null,
              audit: audit || null, unitBackward: !!cfg.unitBackward },
       emb: add("emb", mk(vocabSize() * c, 0.08)),
@@ -424,6 +424,14 @@
         bmm(tr(cache.dlogits, BT, vocab), cache.lnf.y, vocab, BT, C),
         bmm(cache.dlogits, m.emb, BT, vocab, C),
       ]);
+    }
+    // live-shape audit of the f32 GEMM pair (both legs; gated only at small shapes)
+    if ((m.ctx.fgemm2 || m.ctx.fgemm) && !units && m.ctx.audit && m.ctx.audit.due()) {
+      const bad = V.auditFgemm(cache.dlogits, cache.lnf.y, { m: vocab, k: BT, n: C, transA: true },
+                               g[gi.emb], m.ctx.fgemmFma, m.ctx.audit.cells) ||
+                  V.auditFgemm(cache.dlogits, m.emb, { m: BT, k: vocab, n: C },
+                               dlnfIn, m.ctx.fgemmFma, m.ctx.audit.cells);
+      if (bad) m.ctx.audit.fail(bad);
     }
     let dx = lnBwd(dlnfIn, cache.lnf.y, cache.lnf.sig, BT, C);
     const scale = 1 / Math.sqrt(hd);

@@ -28,7 +28,18 @@ def configure_cpu(fraction: float = 0.9) -> int:
     cores = os.cpu_count() or 1
     n = max(1, int(round(cores * fraction)))
     torch.set_num_threads(n)
+    pin_fp_mode()
     return n
+
+
+def pin_fp_mode() -> None:
+    """Pin the host floating-point mode: subnormals ON (no flush-to-zero / denormals-are-zero).
+
+    FTZ/DAZ live in the thread's MXCSR, and any library built with -ffast-math can switch them
+    on just by being loaded (the emulator found exactly this leaking into Python, 2026-09).
+    MEASURED 2026-10-14: the same seed and gradients through 5 Adam steps give DIFFERENT weights
+    with torch.set_flush_denormal(True) -- so one node with a leaked FTZ forks its replica."""
+    torch.set_flush_denormal(False)
 
 
 def _cuda_usable() -> bool:
@@ -60,9 +71,14 @@ def _available_ram_gb():
         return None
 
 
-def capacity_score(device=None, secs: float = 0.3) -> float:
+def capacity_score(device=None, secs: float = 0.3):
     """Measured throughput: fixed matmuls/sec on the local device. Self-calibrating
-    (a GPU scores far higher), so capacity weighting hands it a bigger batch."""
+    (a GPU scores far higher), so capacity weighting hands it a bigger batch.
+
+    Returns None if the measurement fails. It used to return the core count instead -- a number
+    in a DIFFERENT UNIT that cluster_plan then weighed against other nodes' matmuls/sec, so a node
+    whose benchmark threw got ~8 "capacity" next to a peer's ~200 and a sliver of the batch, with
+    nothing in the plan saying why (2026-10-14: a fallback that looks like a result)."""
     dev = device or pick_device()
     try:
         a = torch.randn(512, 512, device=dev)
@@ -78,7 +94,7 @@ def capacity_score(device=None, secs: float = 0.3) -> float:
             torch.cuda.synchronize()
         return it / (time.time() - t0)
     except Exception:
-        return float(os.cpu_count() or 1)
+        return None
 
 
 def survey_node(cpu_fraction: float = 0.9, measure: bool = True) -> dict:
@@ -86,15 +102,36 @@ def survey_node(cpu_fraction: float = 0.9, measure: bool = True) -> dict:
     dev = pick_device()
     gpu = _gpu_info() if dev.type == "cuda" else None
     if "DAISY_CAPACITY" in os.environ:
-        cap = float(os.environ["DAISY_CAPACITY"])
+        cap, unit = float(os.environ["DAISY_CAPACITY"]), "user"
     elif measure:
-        cap = capacity_score(dev)
+        cap, unit = capacity_score(dev), "matmul/s"
+        if cap is None:
+            cap, unit = float(cores), "cores"
     else:
-        cap = float(cores)
+        cap, unit = float(cores), "cores"
     return {"host": socket.gethostname(), "cores": cores,
             "threads": max(1, int(round(cores * cpu_fraction))),
             "ram_gb": _available_ram_gb(), "device": dev.type,
-            "gpu": gpu, "capacity": cap}
+            "gpu": gpu, "capacity": cap, "capacity_unit": unit}
+
+
+def plan_capacities(nodes):
+    """Per-node capacities in ONE unit, plus the unit used.
+
+    Measured matmuls/sec and core counts are not comparable. If the measured nodes do not all
+    share a unit, every node falls back to its core count (a coarser but consistent weighting)
+    instead of mixing the two. A DAISY_CAPACITY override ("user") is taken as stated: the
+    operator chose its scale. Nodes from an older survey without a unit count as "cores" if
+    their capacity equals their core count, else as measured."""
+    def unit_of(g):
+        u = g.get("capacity_unit")
+        if u:
+            return u
+        return "cores" if float(g.get("capacity") or 0) == float(g["cores"]) else "matmul/s"
+    units = {unit_of(g) for g in nodes} - {"user"}
+    if len(units) > 1:
+        return [float(g["cores"]) for g in nodes], "cores (mixed units: %s)" % ", ".join(sorted(units))
+    return [float(g.get("capacity") or g["cores"]) for g in nodes], (units.pop() if units else "user")
 
 
 # ------------------------------------------------------------------ cluster ---
@@ -111,7 +148,10 @@ def cluster_plan(cpu_fraction: float = 0.9, base_batch: int = 32) -> dict:
     gathered = [None] * world
     dist.all_gather_object(gathered, me)
 
-    caps = [float(g.get("capacity") or g["cores"]) for g in gathered]
+    caps, cap_unit = plan_capacities(gathered)
+    if cap_unit.startswith("cores (mixed") and rank == 0:
+        print("  [plan] capacity measured in different units across nodes -- weighting every node "
+              "by core count instead (%s)" % cap_unit, flush=True)
     total_cap = sum(caps) or world
     global_batch = base_batch * world
     batches = [max(1, round(global_batch * c / total_cap)) for c in caps]
@@ -125,8 +165,37 @@ def cluster_plan(cpu_fraction: float = 0.9, base_batch: int = 32) -> dict:
             "total_ram_gb": (sum(rams) if rams else None),
             "global_batch": sum(batches),
             "devices": [g.get("device", "cpu") for g in gathered],
-            "capacities": [round(c, 1) for c in caps],
+            "capacities": [round(c, 1) for c in caps], "capacity_unit": cap_unit,
             "gpus": [g.get("gpu") for g in gathered]}
+
+
+@torch.no_grad()
+def param_hash(params) -> int:
+    """64-bit BLAKE2b digest of the exact parameter BITS (CPU copies), for replica checks."""
+    import hashlib
+    h = hashlib.blake2b(digest_size=8)
+    for p in params:
+        h.update(p.detach().to("cpu").contiguous().view(-1).numpy().tobytes())
+    return int.from_bytes(h.digest(), "little", signed=True)
+
+
+@torch.no_grad()
+def check_replicas(params, step: int) -> None:
+    """Refuse to continue if any replica's parameter bits differ from rank 0's. A collective.
+
+    replica_diff used to run once, AFTER training: a fork at step 1 surfaced only as a final
+    number. The web client hashes weights every step; this is the same check for the cluster."""
+    mine = torch.tensor([param_hash(params)], dtype=torch.int64)
+    allh = [torch.zeros_like(mine) for _ in range(dist.get_world_size())]
+    dist.all_gather(allh, mine)
+    bad = [r for r, h in enumerate(allh) if int(h) != int(allh[0])]
+    if bad:
+        raise RuntimeError("step %d: replica(s) %s diverged from rank 0 (parameter bits differ); "
+                           "refusing to continue on forked weights" % (step, bad))
+
+
+def mixed_devices(plan) -> bool:
+    return len(set(plan.get("devices") or [])) > 1
 
 
 @torch.no_grad()
@@ -204,15 +273,38 @@ class DaisyCluster:
             pass
 
     def fit(self, model, task, steps=500, lr=1e-2, optimizer="sgd",
-            status_path=None, step_delay=0.0):
+            status_path=None, step_delay=0.0, check_every=None):
         """Train `model` on `task` (build_model already called). task.sample(n)
-        draws this node's shard; task.loss(model, X, y) returns a scalar."""
+        draws this node's shard; task.loss(model, X, y) returns a scalar.
+
+        Mixed CPU/GPU fleets: the optimizer runs on CPU MASTER copies on every rank. MEASURED
+        2026-10-14 (RTX, torch 2.x): CUDA Adam vs CPU Adam on identical gradients differ in ~2% of
+        weights after 20 steps (default, foreach=False and fused=True alike) -- the same update
+        rule, two implementations, two roundings. Replicas forked at step 1 and nothing checked
+        until replica_diff after training. One implementation everywhere, like an emulator that
+        must give one semantics on two backends. Homogeneous fleets keep the on-device optimizer.
+        Every `check_every` steps (default: the logging cadence) all ranks compare a hash of
+        their parameter bits and stop on any difference (DAISY_CPU_OPT=0/1 overrides the choice)."""
         model.to(self.device)
+        pin_fp_mode()                            # fit may run on a thread configure_cpu never saw
         broadcast_params(model)
-        if optimizer == "adam":
-            opt = torch.optim.Adam(model.parameters(), lr=lr)
+        params = list(model.parameters())
+        force = os.environ.get("DAISY_CPU_OPT")
+        cpu_opt = (force == "1") if force in ("0", "1") else \
+            (mixed_devices(self.plan) and self.device.type != "cpu")
+        if cpu_opt:
+            master = [torch.nn.Parameter(p.detach().to("cpu").clone()) for p in params]
+            opt_params = master
         else:
-            opt = torch.optim.SGD(model.parameters(), lr=lr)
+            master, opt_params = None, params
+        if optimizer == "adam":
+            opt = torch.optim.Adam(opt_params, lr=lr)
+        else:
+            opt = torch.optim.SGD(opt_params, lr=lr)
+        if self.is_master() and mixed_devices(self.plan):
+            print("  [fit] mixed devices %s: optimizer on CPU master copies on GPU ranks"
+                  % sorted(set(self.plan["devices"])), flush=True)
+        every = check_every or max(1, steps // 20)
         w, nb = self.plan["my_weight"], self.plan["my_local_batch"]
         for s in range(steps):
             X, y = task.sample(nb)
@@ -222,7 +314,17 @@ class DaisyCluster:
             loss.backward()
             capacity_weighted_allreduce_grads(model, w)
             check_finite_grads(model, s)
-            opt.step()
+            if master is not None:
+                with torch.no_grad():
+                    for mp, p in zip(master, params):
+                        mp.grad = p.grad.detach().to("cpu")
+                    opt.step()
+                    for mp, p in zip(master, params):
+                        p.data.copy_(mp.data.to(p.data.device))
+            else:
+                opt.step()
+            if s % every == 0 or s == steps - 1:
+                check_replicas(params, s)              # collective: every rank calls it
             if step_delay:
                 time.sleep(step_delay)
             if s % max(1, steps // 20) == 0 or s == steps - 1:

@@ -99,6 +99,19 @@ def main():
     ck("the weights were never touched",
        all(torch.equal(a, b) for a, b in zip(before, lin.parameters())))
 
+    print("plan_capacities -- never weigh matmuls/sec against core counts (2026-10-14)")
+    from daisychain.cluster import plan_capacities
+    meas = {"cores": 8, "capacity": 210.0, "capacity_unit": "matmul/s"}
+    fell = {"cores": 8, "capacity": 8.0, "capacity_unit": "cores"}      # its benchmark threw
+    caps, unit = plan_capacities([meas, dict(meas, capacity=190.0)])
+    ck("all measured: the measured capacities are used", caps == [210.0, 190.0] and unit == "matmul/s")
+    caps, unit = plan_capacities([meas, fell])
+    ck("one fallback: EVERY node weighs by cores, not 210 vs 8", caps == [8.0, 8.0] and "mixed" in unit, (caps, unit))
+    caps, unit = plan_capacities([meas, {"cores": 4, "capacity": 999.0, "capacity_unit": "user"}])
+    ck("a DAISY_CAPACITY override is taken as stated", caps == [210.0, 999.0], caps)
+    caps, unit = plan_capacities([{"cores": 8, "capacity": 8.0}, {"cores": 8, "capacity": 150.0}])
+    ck("old-format surveys (no unit) are classified, and mixed -> cores", caps == [8.0, 8.0], caps)
+
     print()
     if FAILURES:
         print("FAILED: %d" % len(FAILURES))
