@@ -42,6 +42,29 @@ def pin_fp_mode() -> None:
     torch.set_flush_denormal(False)
 
 
+def fp_mode_ok() -> bool:
+    """True if this thread keeps subnormals: FTZ off (a normal*normal product may be subnormal)
+    and DAZ off (a subnormal input is read as itself)."""
+    ftz = torch.tensor([1e-20], dtype=torch.float32) * torch.tensor([1e-20], dtype=torch.float32)
+    daz = torch.tensor([1e-39], dtype=torch.float32) * 1.0
+    return float(ftz) != 0.0 and float(daz) != 0.0
+
+
+def repin_fp_mode(step: int, rank: int) -> bool:
+    """Re-check the FP mode before an optimizer step; re-pin and say so if it was flipped.
+
+    pin_fp_mode runs once at start, but a library imported mid-run (a dataloader worker's
+    dependency, a fast-math extension) can switch FTZ/DAZ on afterwards. The emulator restores
+    MXCSR around EVERY guest call for this reason; here the replica hash would catch the fork
+    later with nothing naming the cause. Returns True if the mode had been flipped."""
+    if fp_mode_ok():
+        return False
+    pin_fp_mode()
+    print("  [fp] rank %d step %d: flush-to-zero/denormals-are-zero was switched ON since the "
+          "last step (a library changed MXCSR); re-pinned subnormals ON" % (rank, step), flush=True)
+    return True
+
+
 def _cuda_usable() -> bool:
     """is_available() alone is not enough: with CUDA_VISIBLE_DEVICES set but EMPTY (a common way
     to say "CPU only") torch reports available=True and device_count()=0, and the node crashed
@@ -314,6 +337,7 @@ class DaisyCluster:
             loss.backward()
             capacity_weighted_allreduce_grads(model, w)
             check_finite_grads(model, s)
+            repin_fp_mode(s, self.rank)                # before the step: the update is where FTZ forks
             if master is not None:
                 with torch.no_grad():
                     for mp, p in zip(master, params):

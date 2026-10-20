@@ -112,6 +112,16 @@ def main():
     caps, unit = plan_capacities([{"cores": 8, "capacity": 8.0}, {"cores": 8, "capacity": 150.0}])
     ck("old-format surveys (no unit) are classified, and mixed -> cores", caps == [8.0, 8.0], caps)
 
+    print("repin_fp_mode -- FTZ switched on mid-run is noticed and undone (2026-10-20)")
+    from daisychain.cluster import fp_mode_ok, pin_fp_mode, repin_fp_mode
+    pin_fp_mode()
+    ck("subnormals kept after pin_fp_mode", fp_mode_ok())
+    ck("no flip: repin reports nothing", repin_fp_mode(0, 0) is False)
+    torch.set_flush_denormal(True)                    # what a fast-math library does on load
+    ck("fp_mode_ok sees the flip", not fp_mode_ok())
+    ck("repin reports the flip", repin_fp_mode(7, 0) is True)
+    ck("...and subnormals are back", fp_mode_ok())
+
     print()
     if FAILURES:
         print("FAILED: %d" % len(FAILURES))
